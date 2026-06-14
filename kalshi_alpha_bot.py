@@ -6,7 +6,7 @@ INSTALLATION:
     pip install anthropic requests python-dotenv flask flask-cors cryptography
 
 FICHIER .env :
-    ANTHROPIC_API_KEY=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
+    ANTHROPIC_API_KEY=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
     KALSHI_KEY_ID=b6fb1530-999b-481a-862f-5babdf528c6f
     KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEA2aJyyFw/O6bV2cmN7YW8quNT2oYb8DDpdmeoRgz6k2h6LQMk
@@ -238,7 +238,7 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
         for attempt in range(1, retries + 1):
             try:
                 resp = self.client.messages.create(
-                    model="claude-3-5-sonnet-latest",
+                    model="claude-sonnet-4-6",
                     max_tokens=4000,
                     system=SYSTEM_PROMPT,
                     messages=[{"role": "user", "content": prompt}],
