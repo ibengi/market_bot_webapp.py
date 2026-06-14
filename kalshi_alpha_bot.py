@@ -6,7 +6,7 @@ INSTALLATION:
     pip install anthropic requests python-dotenv flask flask-cors cryptography
 
 FICHIER .env :
-    ANTHROPIC_API_KEY=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
+    ANTHROPIC_API_KEY=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
     KALSHI_KEY_ID=b6fb1530-999b-481a-862f-5babdf528c6f
     KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEA2aJyyFw/O6bV2cmN7YW8quNT2oYb8DDpdmeoRgz6k2h6LQMk
@@ -50,6 +50,25 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import requests
 import anthropic
+
+# Import FRED context (optionnel)
+try:
+    from fred_context import get_macro_context
+    FRED_AVAILABLE = True
+except ImportError:
+    FRED_AVAILABLE = False
+    def get_macro_context(target="CPI"):
+        return ""
+
+# Import BTC context (optionnel)
+try:
+    from btc_context import get_btc_context, get_btc_price
+    BTC_AVAILABLE = True
+except ImportError:
+    BTC_AVAILABLE = False
+    def get_btc_context(target_price=0, minutes=15):
+        return ""
+
 
 load_dotenv()
 
@@ -417,6 +436,37 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
     trades_this_cycle = 0
 
+    # ── Mode BTC 15min ───────────────────────────────────────────────────────
+    if getattr(args, 'btc', False) and BTC_AVAILABLE:
+        btc_price = get_btc_price()
+        target    = getattr(args, 'btc_target', 0) or (btc_price or 65000)
+        minutes   = getattr(args, 'btc_minutes', 15)
+        log.info(f"Mode BTC {minutes}min | Prix: ${btc_price:,.2f} | Target: ${target:,.2f}")
+
+        btc_ctx = get_btc_context(target_price=target, minutes=minutes)
+        ticker  = f"KXBTC{minutes}M"
+        market_data = {
+            "ticker":     ticker,
+            "title":      f"BTC {minutes}min > ${target:,.2f}",
+            "yes_bid":    50,
+            "no_bid":     50,
+            "volume":     50000,
+            "close_time": "dans 15 minutes",
+            "category":   "crypto",
+            "subtitle":   f"BTC actuel ${btc_price:,.2f}",
+        }
+        log.info("Lancement analyse BTC Claude (10 phases)...")
+        analysis = engine.analyse(market_data, context=btc_ctx)
+        if analysis:
+            print_report(ticker, analysis)
+            manager.save_state(analysis, ticker, cycle)
+            trade = manager.execute(market_data, analysis)
+            if trade:
+                trades_this_cycle += 1
+        else:
+            log.error("Analyse BTC vide.")
+        return trades_this_cycle
+
     if args.market:
         log.info(f"Analyse du marche : {args.market}")
         market_data = kalshi.get_market(args.market)
@@ -434,8 +484,21 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 "subtitle":   "CPI June 2026",
             }
 
+        # Recupere le contexte macro FRED automatiquement
+        fred_ctx = ""
+        if FRED_AVAILABLE and os.getenv("FRED_API_KEY"):
+            log.info("Recuperation contexte macro FRED...")
+            fred_ctx = get_macro_context(target="CPI")
+        
+        # Combine contexte FRED + contexte manuel
+        full_context = ""
+        if fred_ctx:
+            full_context += fred_ctx + "\n\n"
+        if args.context:
+            full_context += "CONTEXTE ADDITIONNEL: " + args.context
+
         log.info("Lancement analyse Claude (10 phases)...")
-        analysis = engine.analyse(market_data, context=args.context)
+        analysis = engine.analyse(market_data, context=full_context or args.context)
 
         if analysis:
             print_report(args.market, analysis)
@@ -481,6 +544,9 @@ def main():
     parser.add_argument("--context",  type=str,   default="")
     parser.add_argument("--loop",     action="store_true", help="Boucle automatique")
     parser.add_argument("--interval", type=int,   default=300, help="Secondes entre cycles (defaut: 300)")
+    parser.add_argument("--btc",      action="store_true", help="Mode BTC 15min Kalshi")
+    parser.add_argument("--btc-target", type=float, default=0.0, help="Prix target BTC (ex: 65145.57)")
+    parser.add_argument("--btc-minutes", type=int,  default=15,  help="Duree contrat BTC en minutes")
     args = parser.parse_args()
 
     print("\n" + "="*62)
