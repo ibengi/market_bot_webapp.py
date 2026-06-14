@@ -6,7 +6,7 @@ INSTALLATION:
     pip install anthropic requests python-dotenv flask flask-cors cryptography
 
 FICHIER .env :
-    ANTHROPIC_API_KEY=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
+    ANTHROPIC_API_KEY=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
     KALSHI_KEY_ID=b6fb1530-999b-481a-862f-5babdf528c6f
     KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----
 MIIEpQIBAAKCAQEA2aJyyFw/O6bV2cmN7YW8quNT2oYb8DDpdmeoRgz6k2h6LQMk
