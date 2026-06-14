@@ -15,9 +15,39 @@ CONFIGURATION :
     KALSHI_API_SECRET=<ton secret RSA Kalshi>
 
 USAGE :
-    python kalshi_alpha_bot.py --market "KXCPI-25JUN-B3" --capital 1000
-    python kalshi_alpha_bot.py --scan           # scanne tous les marchés actifs
-    python kalshi_alpha_bot.py --demo           # mode paper trading (aucun trade réel)
+    KALSHI_KEY_ID = os.getenv("b6fb1530-999b-481a-862f-5babdf528c6f", "")
+KALSHI_PRIVATE_KEY = os.getenv("-----BEGIN RSA PRIVATE KEY-----
+MIIEpQIBAAKCAQEA2aJyyFw/O6bV2cmN7YW8quNT2oYb8DDpdmeoRgz6k2h6LQMk
+d1+KLtQVzEwI97vXeuJpDLCnzXQhgXVhM9xqhhUXXm3CS9qC6LctXf8QMFHuc5lE
+WPbzuNbwYv+PJFFfZ9icplmx3qQ+fViSbU8W6uIFByLIxO7vUOnny2qPkD6u34IF
+3KIEueC2QvSiPBsKCBZODq12SbV5IHwcbtHlEe7wEXMSxUPSiBEnF/6bjpA9ysOn
+RRFRw9WTA9QzME48XSLyO2Rk1ktW1NEnhry1LBk4owudMacgBtYn0fseB78I6c0l
+rXbCI1/ifdb1vcylsTW1HPlB5nNttM/D0m587QIDAQABAoIBAD126K33h5BETQ9G
+IkRbye4FZ/BGgetzFOxw2BB4p+gr0J2Xzpu8Kt2Q3lslej7lGTVGbl68IZgf3Tqf
+uQUZkiguGrx7iS09GE27Nh/e4maTLSIOvkPV8v1YDuoWvQmHxcchYRSGLnrvrgpe
+knQ2qwVJMhxS0Zr01Dfo56MGhGc7FzjsyRXbyVdAKISn/EKFxARSN+2e1Xlv1ub2
+IP0lXG6PJRKyp9QMevv6m3QlCUhxMgrSlq66gLl0A/YXc8FJ1Aug1TAS9gOYl4N/
+2b60Gxox3p0bT02W+fsFrsQwlmxtzrhtFUxArlA5+m0Ca8BqcMA4OlrYDRWQPZ46
+BJh1p80CgYEA3dPxx4Zvx8Y4Int79YWdz9usnBnQrsa6/PWNpMfbE4IJitSCqC+l
+5TqVDKVaXHQOQ7XyWJJqMU51yJeMLQCMkT18htNQHyrDw8aAjCKIKfcf5rGOgU0g
+eU4DxAoxq9KPH66Dfcpcah6XBhiu6P+T4JzzLXUE/gUWnfPzDzCbF2cCgYEA+yki
+XnimvBnFJ9Dsxi7HKTAMFS7flfN2aDZQZ/pOOST1tRnd//bqG7aphMjpzBdch4Sb
+EZLk4F2hOE9FlAOrMDNDp3Zn+g+9zgC6SYDrsrDKVqVuuAwbU+pF0DRJfG3A0Ull
+7i+d7Ne7j2lO0lmx0UFV9GUvj2PB+8yKZizr+IsCgYEAqoZfew5xp5VNWdSrehZ5
+NmycyHNf5LuIyyTI+j9Yvipcw4iR2FCoqwrZwZrrV98viAW6gzQqxjSWftlhPMcL
+SCuIKu0OzqbFTx6tewyguAHtWB5ueh+cMyQx6OYdQQTgWW6CTpTdbgaN+nXHH/44
+45ZDqlImwE+RD2OVGbw3vUkCgYEAwk/Frk8ruBU76h0CQiWIof3xKyZThsCQF/oF
+ZRxLDnzgt5bmoRRXdM9yATAraWGdjZ7zFbqO5mKpy1XRH71i4OyYZ+P8d4NcNhds
+CFf8ggey0yw0J6H+NoLmNjltrR2AcqqVeJxQUx9olYBEogsQvjMNHAJ4tDfaqUNK
+w9f3TBcCgYEAhARiPrqkCjYzwwb3XXwbfSCGwX9u5LIvRBw1KdswwyM+Do6KQZnG
+IkE0Zr+sSlGddphKbL4e4FGQT3gKAOXrz1Pr57JWxSz1nD3D/Qp9wV0JyeQXse/J
+O3nsPWuJwf0jV/bDFhIYJ0ZgS3VLlEw5SoPaXah0e1I6JhRcj78kVjM=
+-----END RSA PRIVATE KEY-----
+
+", "")
+
+KALSHI_BASE_URL = "https://trading-api.kalshi.com/trade-api/v2"
+KALSHI_DEMO_URL = "https://demo-api.kalshi.co/trade-api/v2"
 """
 
 import os
@@ -45,9 +75,36 @@ logging.basicConfig(
 )
 log = logging.getLogger("KalshiAlpha")
 
-ANTHROPIC_API_KEY  = os.getenv("ANTHROPIC_API_KEY", "")
-KALSHI_API_KEY     = os.getenv("KALSHI_API_KEY", "")
-KALSHI_API_SECRET  = os.getenv("KALSHI_API_SECRET", "")
+ANTHROPIC_API_KEY  = os.getenv("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", "")
+KALSHI_API_KEY     = os.getenv("b6fb1530-999b-481a-862f-5babdf528c6f", "")
+KALSHI_API_SECRET  = os.getenv("-----BEGIN RSA PRIVATE KEY-----
+MIIEpQIBAAKCAQEA2aJyyFw/O6bV2cmN7YW8quNT2oYb8DDpdmeoRgz6k2h6LQMk
+d1+KLtQVzEwI97vXeuJpDLCnzXQhgXVhM9xqhhUXXm3CS9qC6LctXf8QMFHuc5lE
+WPbzuNbwYv+PJFFfZ9icplmx3qQ+fViSbU8W6uIFByLIxO7vUOnny2qPkD6u34IF
+3KIEueC2QvSiPBsKCBZODq12SbV5IHwcbtHlEe7wEXMSxUPSiBEnF/6bjpA9ysOn
+RRFRw9WTA9QzME48XSLyO2Rk1ktW1NEnhry1LBk4owudMacgBtYn0fseB78I6c0l
+rXbCI1/ifdb1vcylsTW1HPlB5nNttM/D0m587QIDAQABAoIBAD126K33h5BETQ9G
+IkRbye4FZ/BGgetzFOxw2BB4p+gr0J2Xzpu8Kt2Q3lslej7lGTVGbl68IZgf3Tqf
+uQUZkiguGrx7iS09GE27Nh/e4maTLSIOvkPV8v1YDuoWvQmHxcchYRSGLnrvrgpe
+knQ2qwVJMhxS0Zr01Dfo56MGhGc7FzjsyRXbyVdAKISn/EKFxARSN+2e1Xlv1ub2
+IP0lXG6PJRKyp9QMevv6m3QlCUhxMgrSlq66gLl0A/YXc8FJ1Aug1TAS9gOYl4N/
+2b60Gxox3p0bT02W+fsFrsQwlmxtzrhtFUxArlA5+m0Ca8BqcMA4OlrYDRWQPZ46
+BJh1p80CgYEA3dPxx4Zvx8Y4Int79YWdz9usnBnQrsa6/PWNpMfbE4IJitSCqC+l
+5TqVDKVaXHQOQ7XyWJJqMU51yJeMLQCMkT18htNQHyrDw8aAjCKIKfcf5rGOgU0g
+eU4DxAoxq9KPH66Dfcpcah6XBhiu6P+T4JzzLXUE/gUWnfPzDzCbF2cCgYEA+yki
+XnimvBnFJ9Dsxi7HKTAMFS7flfN2aDZQZ/pOOST1tRnd//bqG7aphMjpzBdch4Sb
+EZLk4F2hOE9FlAOrMDNDp3Zn+g+9zgC6SYDrsrDKVqVuuAwbU+pF0DRJfG3A0Ull
+7i+d7Ne7j2lO0lmx0UFV9GUvj2PB+8yKZizr+IsCgYEAqoZfew5xp5VNWdSrehZ5
+NmycyHNf5LuIyyTI+j9Yvipcw4iR2FCoqwrZwZrrV98viAW6gzQqxjSWftlhPMcL
+SCuIKu0OzqbFTx6tewyguAHtWB5ueh+cMyQx6OYdQQTgWW6CTpTdbgaN+nXHH/44
+45ZDqlImwE+RD2OVGbw3vUkCgYEAwk/Frk8ruBU76h0CQiWIof3xKyZThsCQF/oF
+ZRxLDnzgt5bmoRRXdM9yATAraWGdjZ7zFbqO5mKpy1XRH71i4OyYZ+P8d4NcNhds
+CFf8ggey0yw0J6H+NoLmNjltrR2AcqqVeJxQUx9olYBEogsQvjMNHAJ4tDfaqUNK
+w9f3TBcCgYEAhARiPrqkCjYzwwb3XXwbfSCGwX9u5LIvRBw1KdswwyM+Do6KQZnG
+IkE0Zr+sSlGddphKbL4e4FGQT3gKAOXrz1Pr57JWxSz1nD3D/Qp9wV0JyeQXse/J
+O3nsPWuJwf0jV/bDFhIYJ0ZgS3VLlEw5SoPaXah0e1I6JhRcj78kVjM=
+-----END RSA PRIVATE KEY-----
+", "")
 
 KALSHI_BASE_URL    = "https://trading-api.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL    = "https://demo-api.kalshi.co/trade-api/v2"
@@ -189,21 +246,74 @@ RÈGLES CRITIQUES :
 """
 
 # ─── Client Kalshi API ────────────────────────────────────────────────────────
+import base64
+from urllib.parse import urlparse
+from cryptography.hazmat.primitives import serialization, hashes
+from cryptography.hazmat.primitives.asymmetric import padding
+
 
 class KalshiClient:
     def __init__(self, demo: bool = False):
         self.base_url = KALSHI_DEMO_URL if demo else KALSHI_BASE_URL
-        self.demo     = demo
-        self.session  = requests.Session()
-        self.session.headers.update({
+        self.demo = demo
+        self.session = requests.Session()
+        self.private_key = self._load_private_key()
+
+    def _load_private_key(self):
+        if not KALSHI_KEY_ID:
+            raise ValueError("KALSHI_KEY_ID manquant dans les variables Railway")
+
+        if not KALSHI_PRIVATE_KEY:
+            raise ValueError("KALSHI_PRIVATE_KEY manquant dans les variables Railway")
+
+        private_key_text = KALSHI_PRIVATE_KEY.replace("\\n", "\n").strip()
+
+        return serialization.load_pem_private_key(
+            private_key_text.encode("utf-8"),
+            password=None,
+        )
+
+    def _sign(self, method: str, path: str) -> dict:
+        timestamp = str(int(time.time() * 1000))
+
+        full_path = urlparse(self.base_url + path).path
+        path_without_query = full_path.split("?")[0]
+
+        message = f"{timestamp}{method.upper()}{path_without_query}".encode("utf-8")
+
+        signature = self.private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+
+        signature_b64 = base64.b64encode(signature).decode("utf-8")
+
+        return {
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {KALSHI_API_KEY}",
-        })
+            "KALSHI-ACCESS-KEY": KALSHI_KEY_ID,
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+            "KALSHI-ACCESS-SIGNATURE": signature_b64,
+        }
+
+    def _request(self, method: str, path: str, **kwargs):
+        headers = self._sign(method, path)
+        url = self.base_url + path
+
+        return self.session.request(
+            method=method.upper(),
+            url=url,
+            headers=headers,
+            timeout=10,
+            **kwargs,
+        )
 
     def get_market(self, ticker: str) -> dict:
-        """Récupère les données d'un marché par son ticker."""
         try:
-            r = self.session.get(f"{self.base_url}/markets/{ticker}", timeout=10)
+            r = self._request("GET", f"/markets/{ticker}")
             r.raise_for_status()
             return r.json().get("market", {})
         except Exception as e:
@@ -211,10 +321,9 @@ class KalshiClient:
             return {}
 
     def get_active_markets(self, category: str = "economic") -> list:
-        """Récupère les marchés actifs dans une catégorie."""
         try:
             params = {"status": "open", "series_ticker": category, "limit": 50}
-            r = self.session.get(f"{self.base_url}/markets", params=params, timeout=10)
+            r = self._request("GET", "/markets", params=params)
             r.raise_for_status()
             return r.json().get("markets", [])
         except Exception as e:
@@ -222,11 +331,10 @@ class KalshiClient:
             return []
 
     def get_balance(self) -> float:
-        """Récupère le solde disponible."""
         try:
-            r = self.session.get(f"{self.base_url}/portfolio/balance", timeout=10)
+            r = self._request("GET", "/portfolio/balance")
             r.raise_for_status()
-            return r.json().get("balance", 0) / 100  # cents → dollars
+            return r.json().get("balance", 0) / 100
         except Exception as e:
             log.error(f"Erreur get_balance: {e}")
             return 0.0
@@ -234,16 +342,21 @@ class KalshiClient:
     def place_order(
         self,
         ticker: str,
-        side: str,      # "yes" ou "no"
-        count: int,     # nombre de contrats
-        price: int,     # prix en cents (1-99)
+        side: str,
+        count: int,
+        price: int,
         dry_run: bool = True,
     ) -> dict:
-        """Place un ordre. dry_run=True → simulation sans exécution réelle."""
         if dry_run or self.demo:
             log.info(f"[DRY RUN] ORDER {side.upper()} {count}x {ticker} @ {price}¢")
-            return {"status": "dry_run", "ticker": ticker, "side": side,
-                    "count": count, "price": price}
+            return {
+                "status": "dry_run",
+                "ticker": ticker,
+                "side": side,
+                "count": count,
+                "price": price,
+            }
+
         try:
             payload = {
                 "ticker": ticker,
@@ -253,14 +366,15 @@ class KalshiClient:
                 "side": side,
                 "count": count,
                 "yes_price": price if side == "yes" else 100 - price,
-                "no_price":  price if side == "no"  else 100 - price,
+                "no_price": price if side == "no" else 100 - price,
             }
-            r = self.session.post(f"{self.base_url}/portfolio/orders",
-                                  json=payload, timeout=10)
+
+            r = self._request("POST", "/portfolio/orders", json=payload)
             r.raise_for_status()
             result = r.json()
             log.info(f"ORDER PLACED: {result}")
             return result
+
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
             return {"error": str(e)}
