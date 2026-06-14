@@ -6,36 +6,35 @@ INSTALLATION:
     pip install anthropic requests python-dotenv flask flask-cors cryptography
 
 FICHIER .env :
-    ANTHROPIC_API_KEY=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
-    KALSHI_KEY_ID=b6fb1530-999b-481a-862f-5babdf528c6f
+    ANTHROPIC_API_KEY=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
+    KALSHI_KEY_ID=6f340427-d259-41a8-9614-94f656dda7e4
     KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----
-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
+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
 -----END RSA PRIVATE KEY-----
-
 
 USAGE:
     python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop
@@ -264,6 +263,11 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
                 )
                 raw = resp.content[0].text.strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
+                # Extrait le premier objet JSON valide
+                start = raw.find("{")
+                end   = raw.rfind("}") + 1
+                if start >= 0 and end > start:
+                    raw = raw[start:end]
                 return json.loads(raw)
             except json.JSONDecodeError as e:
                 log.error(f"JSON invalide (tentative {attempt}): {e}")
