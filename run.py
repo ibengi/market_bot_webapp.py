@@ -31,14 +31,19 @@ def get_current_btc_price() -> float:
 def run_cpi_bot():
     """Lance le bot CPI en boucle toutes les 5 minutes."""
     log.info("Bot CPI demarre — KXCPI-26JUN-T0.1 toutes les 5 min")
-    subprocess.run([
-        sys.executable, "kalshi_alpha_bot.py",
-        "--market", "KXCPI-26JUN-T0.1",
-        "--capital", "500",
-        "--loop",
-        "--interval", "300",
-        "--context", "Analyse CPI juin 2026. Publication le 14 juillet 2026 a 8h30 ET."
-    ])
+    while True:
+        try:
+            subprocess.run([
+                sys.executable, "kalshi_alpha_bot.py",
+                "--market", "KXCPI-26JUN-T0.1",
+                "--capital", "500",
+                "--loop",
+                "--interval", "300",
+                "--context", "Analyse CPI juin 2026. Publication le 14 juillet 2026 a 8h30 ET."
+            ])
+        except Exception as e:
+            log.error(f"Erreur CPI bot: {e}")
+        time.sleep(10)
 
 def run_btc_bot():
     """Lance le bot BTC 15min en boucle toutes les 60 secondes."""
