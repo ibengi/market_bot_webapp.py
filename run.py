@@ -92,7 +92,7 @@ if __name__ == "__main__":
     # Lance tous les bots en threads paralleles
     threads = [
         threading.Thread(target=run_cpi_bot,     daemon=True, name="CPI-Bot"),
-        threading.Thread(target=run_btc_bot,     daemon=True, name="BTC-Bot"),
+       # threading.Thread(target=run_btc_bot,     daemon=True, name="BTC-Bot"),
         threading.Thread(target=run_fred_updater,daemon=True, name="FRED-Updater"),
     ]
 
