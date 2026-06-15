@@ -36,14 +36,15 @@ gRBpqUqbOBxClhWQh6LvRjQYUjpxYg77HnBGFk88vQCXhjxX8QNaTRqIp8oDdkHX
 hfR8Z8VxNnxHQoUM5ICzhHd2/k1IAAXv4CCMyXj8DeKQi47NIK8=
 -----END RSA PRIVATE KEY-----
 """
-KALSHI MACRO ALPHA ENGINE V3
+KALSHI MACRO ALPHA ENGINE V3 - MODE LIVE PAR DEFAUT
 USAGE:
-    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop
-    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --capital 100 --loop
+    python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --loop          # LIVE
+    python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --demo --loop   # DEMO
+    python kalshi_alpha_bot.py --scan --loop                             # LIVE scan
 """
 
 import os, json, time, sys, argparse, logging, base64
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -74,7 +75,7 @@ except ImportError:
 
 load_dotenv()
 
-# ── Logging UTF-8 (fix Windows) ───────────────────────────────────────────────
+# ── Logging UTF-8 (fix Windows) ──────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -87,7 +88,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("KalshiAlpha")
 
-# ── Variables d'environnement ─────────────────────────────────────────────────
+# ── Variables d environnement ─────────────────────────────────────────────────
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 KALSHI_KEY_ID     = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIV_KEY   = os.getenv("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
@@ -98,6 +99,10 @@ KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 KALSHI_FEE_RATE   = 0.0245
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
+
+# ── Limites de securite LIVE ──────────────────────────────────────────────────
+MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
+MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es KALSHI MACRO ALPHA ENGINE V2.
@@ -139,9 +144,76 @@ REGLES ABSOLUES :
 - taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
 """
 
+
+# ── Gestionnaire de risque journalier ────────────────────────────────────────
+class RiskManager:
+    RISK_FILE = "risk_state.json"
+
+    def __init__(self, max_daily_loss: float, max_trades_cycle: int):
+        self.max_daily_loss   = max_daily_loss
+        self.max_trades_cycle = max_trades_cycle
+        self._state           = self._load()
+
+    def _load(self) -> dict:
+        today = date.today().isoformat()
+        if os.path.exists(self.RISK_FILE):
+            try:
+                with open(self.RISK_FILE, encoding="utf-8") as f:
+                    s = json.load(f)
+                if s.get("date") == today:
+                    return s
+            except Exception:
+                pass
+        return {"date": today, "daily_loss": 0.0, "daily_trades": 0}
+
+    def _save(self):
+        with open(self.RISK_FILE, "w", encoding="utf-8") as f:
+            json.dump(self._state, f, indent=2)
+
+    def _refresh_day(self):
+        today = date.today().isoformat()
+        if self._state.get("date") != today:
+            self._state = {"date": today, "daily_loss": 0.0, "daily_trades": 0}
+            self._save()
+
+    def can_trade(self, trades_this_cycle: int):
+        self._refresh_day()
+        if self._state["daily_loss"] >= self.max_daily_loss:
+            return False, (
+                f"STOP LOSS JOURNALIER atteint — "
+                f"perte={self._state['daily_loss']:.2f}$ / limite={self.max_daily_loss:.2f}$"
+            )
+        if trades_this_cycle >= self.max_trades_cycle:
+            return False, (
+                f"LIMITE TRADES/CYCLE atteinte — "
+                f"{trades_this_cycle}/{self.max_trades_cycle} trades ce cycle"
+            )
+        return True, ""
+
+    def record_trade(self, cost_dollars: float):
+        self._refresh_day()
+        self._state["daily_loss"]   += cost_dollars
+        self._state["daily_trades"] += 1
+        self._save()
+        log.info(
+            f"[RISK] Perte potentielle jour: {self._state['daily_loss']:.2f}$ / "
+            f"{self.max_daily_loss:.2f}$ | Trades jour: {self._state['daily_trades']}"
+        )
+
+    @property
+    def daily_loss(self) -> float:
+        self._refresh_day()
+        return self._state["daily_loss"]
+
+    @property
+    def daily_trades(self) -> int:
+        self._refresh_day()
+        return self._state["daily_trades"]
+
+
 # ── Client Kalshi RSA ─────────────────────────────────────────────────────────
 class KalshiClient:
-    def __init__(self, demo: bool = True):
+    def __init__(self, demo: bool = False):
         self.base_url = KALSHI_DEMO_URL if demo else KALSHI_BASE_URL
         self.demo     = demo
         self.session  = requests.Session()
@@ -171,11 +243,8 @@ class KalshiClient:
             msg = f"{ts}{method.upper()}{urlparse(path).path}".encode()
             sig = self._pk.sign(
                 msg,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.DIGEST_LENGTH
-                ),
-                hashes.SHA256()
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+                hashes.SHA256(),
             )
             return {
                 "Content-Type":            "application/json",
@@ -190,8 +259,7 @@ class KalshiClient:
     def _req(self, method: str, path: str, **kw):
         headers = self._sign_headers(method, self.base_url + path)
         return self.session.request(
-            method.upper(), self.base_url + path,
-            headers=headers, timeout=15, **kw
+            method.upper(), self.base_url + path, headers=headers, timeout=15, **kw
         )
 
     def get_market(self, ticker: str) -> dict:
@@ -217,24 +285,11 @@ class KalshiClient:
             log.error(f"Erreur get_active_markets: {e}")
             return []
 
-    # ── BUG CORRIGE : place_order ─────────────────────────────────────────────
-    # Problemes originaux :
-    #   1. Le bloc try: etait sorti de la methode (indentation a niveau module)
-    #   2. if/else repetes deux fois a la fin du fichier (code orphelin)
-    #   3. Indentation du payload et du if/else incoherente
-    #   4. Le except etait mal aligne avec le try
-    #   5. return {"error": str(e)} suivi de code mort (if side == "yes": ...)
     def place_order(self, ticker: str, side: str, count: int,
-                    price: int, dry_run: bool = True) -> dict:
+                    price: int, dry_run: bool = False) -> dict:
         if dry_run:
             log.info(f"[DRY RUN] {side.upper()} {count}x {ticker} @ {price}c")
-            return {
-                "status": "dry_run",
-                "ticker": ticker,
-                "side":   side,
-                "count":  count,
-                "price":  price,
-            }
+            return {"status": "dry_run", "ticker": ticker, "side": side, "count": count, "price": price}
         try:
             payload = {
                 "ticker":          ticker,
@@ -251,12 +306,11 @@ class KalshiClient:
 
             r = self._req("POST", "/portfolio/orders", json=payload)
             if not r.ok:
-                log.error(f"Detail Kalshi: {r.text}")
+                log.error(f"Detail Kalshi HTTP {r.status_code}: {r.text}")
             r.raise_for_status()
             result = r.json()
-            log.info(f"ORDER PLACED: {result}")
+            log.info(f"[LIVE] ORDER PLACED: {result}")
             return result
-
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
             if hasattr(e, "response") and e.response is not None:
@@ -296,7 +350,6 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
                 )
                 raw = resp.content[0].text.strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
-                # Extrait le premier objet JSON valide
                 start = raw.find("{")
                 end   = raw.rfind("}") + 1
                 if start >= 0 and end > start:
@@ -314,10 +367,12 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 
 # ── Gestionnaire de trades ────────────────────────────────────────────────────
 class TradeManager:
-    def __init__(self, kalshi: KalshiClient, capital: float, demo: bool = True):
+    def __init__(self, kalshi: KalshiClient, capital: float,
+                 demo: bool, risk: RiskManager):
         self.kalshi  = kalshi
         self.capital = capital
         self.demo    = demo
+        self.risk    = risk
         self.trades  = []
 
     def compute_contracts(self, taille_pct: str, price_cents: int) -> int:
@@ -326,7 +381,7 @@ class TradeManager:
             return 0
         return max(1, int(self.capital * pct / (price_cents / 100)))
 
-    def execute(self, market_data: dict, analysis: dict) -> Optional[dict]:
+    def execute(self, market_data: dict, analysis: dict, trades_this_cycle: int) -> Optional[dict]:
         p10       = analysis.get("phase10", {})
         verdict   = p10.get("verdict", "AUCUN TRADE")
         edge      = p10.get("edge", 0)
@@ -337,7 +392,6 @@ class TradeManager:
         if verdict == "AUCUN TRADE":
             log.info(f"[{ticker}] AUCUN TRADE — edge={edge:.1%} conf={confiance}/10")
             return None
-
         if edge < MIN_EDGE or confiance < MIN_CONFIDENCE:
             log.warning(f"[{ticker}] BLOQUE — edge={edge:.1%} conf={confiance}/10")
             return None
@@ -355,34 +409,44 @@ class TradeManager:
             log.warning("Nombre de contrats = 0 — trade annule.")
             return None
 
+        if not self.demo:
+            ok, reason = self.risk.can_trade(trades_this_cycle)
+            if not ok:
+                log.warning(f"[RISK BLOCK] {reason}")
+                return None
+
         result = self.kalshi.place_order(ticker, side, count, price, dry_run=self.demo)
 
+        if not self.demo and "error" not in result:
+            self.risk.record_trade((price / 100) * count)
+
         trade_log = {
-            "timestamp":      datetime.now().isoformat(),
-            "ticker":         ticker,
-            "verdict":        verdict,
-            "side":           side,
-            "count":          count,
-            "price":          price,
-            "edge":           edge,
-            "ev_nette":       p10.get("ev_nette", 0),
-            "grade":          p10.get("grade", ""),
-            "confiance":      confiance,
+            "timestamp":       datetime.now().isoformat(),
+            "mode":            "DEMO" if self.demo else "LIVE",
+            "ticker":          ticker,
+            "verdict":         verdict,
+            "side":            side,
+            "count":           count,
+            "price":           price,
+            "edge":            edge,
+            "ev_nette":        p10.get("ev_nette", 0),
+            "grade":           p10.get("grade", ""),
+            "confiance":       confiance,
             "taille_position": taille,
-            "order":          result,
+            "order":           result,
         }
         self.trades.append(trade_log)
         self._save_trade(trade_log)
         return trade_log
 
     def save_state(self, analysis: dict, ticker: str, cycle: int):
-        """Ecrit l'etat courant pour le dashboard."""
         p10 = analysis.get("phase10", {})
         p8  = analysis.get("phase8",  {})
         p9  = analysis.get("phase9",  {})
         p5  = analysis.get("phase5",  {})
         state = {
             "running":          True,
+            "mode":             "DEMO" if self.demo else "LIVE",
             "cycle":            cycle,
             "last_ticker":      ticker,
             "last_verdict":     p10.get("verdict", "AUCUN TRADE"),
@@ -405,6 +469,10 @@ class TradeManager:
             "score_volatilite": p9.get("volatilite_score", 0),
             "score_edge":       p9.get("edge_score", 0),
             "scenarios":        p5.get("scenarios", []),
+            "daily_loss":       self.risk.daily_loss,
+            "daily_trades":     self.risk.daily_trades,
+            "max_daily_loss":   self.risk.max_daily_loss,
+            "max_trades_cycle": self.risk.max_trades_cycle,
         }
         try:
             with open("bot_state.json", "w", encoding="utf-8") as f:
@@ -427,20 +495,17 @@ class TradeManager:
 
 
 # ── Affichage terminal ────────────────────────────────────────────────────────
-def print_report(ticker: str, analysis: dict):
+def print_report(ticker: str, analysis: dict, demo: bool, risk: RiskManager):
     p10     = analysis.get("phase10", {})
     p8      = analysis.get("phase8",  {})
     verdict = p10.get("verdict", "AUCUN TRADE")
     grade   = p10.get("grade", "")
-    icon    = {
-        "ACHETER YES": "[YES]",
-        "ACHETER NO":  "[NO]",
-        "ATTENDRE":    "[WAIT]",
-        "AUCUN TRADE": "[SKIP]",
-    }.get(verdict, verdict)
+    icon    = {"ACHETER YES": "[YES]", "ACHETER NO": "[NO]",
+               "ATTENDRE": "[WAIT]", "AUCUN TRADE": "[SKIP]"}.get(verdict, verdict)
+    mode_label = "DEMO" if demo else "LIVE"
     print(f"""
 {'='*62}
-  KALSHI ALPHA ENGINE V2 -- {ticker}
+  KALSHI ALPHA ENGINE V3 [{mode_label}] -- {ticker}
   GRADE {grade:<4}  {icon}  {verdict}
 {'='*62}
   Prob reelle   : {p10.get('prob_reelle', 0):.1%}
@@ -456,6 +521,9 @@ def print_report(ticker: str, analysis: dict):
   Risque princ. : {p10.get('risque_principal', '')[:58]}
   Risque exog.  : {p10.get('risque_exogene', '')[:58]}
 {'='*62}
+  [RISK] Perte jour : {risk.daily_loss:.2f}$ / {risk.max_daily_loss:.2f}$
+  [RISK] Trades jour: {risk.daily_trades}
+{'='*62}
 """)
 
 
@@ -463,12 +531,10 @@ def print_report(ticker: str, analysis: dict):
 def countdown(seconds: int, next_cycle: int):
     total = seconds
     for remaining in range(seconds, 0, -1):
-        m, s    = divmod(remaining, 60)
-        filled  = int((total - remaining) / total * 28)
-        bar     = "#" * filled + "-" * (28 - filled)
-        sys.stdout.write(
-            f"\r  Cycle #{next_cycle} dans {m:02d}:{s:02d}  [{bar}]  (Ctrl+C pour arreter)"
-        )
+        m, s   = divmod(remaining, 60)
+        filled = int((total - remaining) / total * 28)
+        bar    = "#" * filled + "-" * (28 - filled)
+        sys.stdout.write(f"\r  Cycle #{next_cycle} dans {m:02d}:{s:02d}  [{bar}]  (Ctrl+C pour arreter)")
         sys.stdout.flush()
         time.sleep(1)
     sys.stdout.write("\r" + " " * 75 + "\r")
@@ -484,62 +550,55 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
     trades_this_cycle = 0
 
-    # ── Mode BTC 15min ───────────────────────────────────────────────────────
+    if not manager.demo:
+        ok, reason = manager.risk.can_trade(trades_this_cycle)
+        if not ok:
+            log.warning(f"[RISK] Cycle bloque: {reason}")
+            return 0
+
     if getattr(args, "btc", False) and BTC_AVAILABLE:
         btc_price = get_btc_price()
         target    = getattr(args, "btc_target", 0) or (btc_price or 65000)
         minutes   = getattr(args, "btc_minutes", 15)
         log.info(f"Mode BTC {minutes}min | Prix: ${btc_price:,.2f} | Target: ${target:,.2f}")
-
         btc_ctx = get_btc_context(target_price=target, minutes=minutes)
         ticker  = f"KXBTC{minutes}M"
         market_data = {
             "ticker":     ticker,
             "title":      f"BTC {minutes}min > ${target:,.2f}",
-            "yes_bid":    50,
-            "no_bid":     50,
-            "volume":     50000,
-            "close_time": "dans 15 minutes",
-            "category":   "crypto",
+            "yes_bid":    50, "no_bid": 50, "volume": 50000,
+            "close_time": "dans 15 minutes", "category": "crypto",
             "subtitle":   f"BTC actuel ${btc_price:,.2f}",
         }
         log.info("Lancement analyse BTC Claude (10 phases)...")
         analysis = engine.analyse(market_data, context=btc_ctx)
         if analysis:
-            print_report(ticker, analysis)
+            print_report(ticker, analysis, manager.demo, manager.risk)
             manager.save_state(analysis, ticker, cycle)
-            trade = manager.execute(market_data, analysis)
+            trade = manager.execute(market_data, analysis, trades_this_cycle)
             if trade:
                 trades_this_cycle += 1
         else:
             log.error("Analyse BTC vide.")
         return trades_this_cycle
 
-    # ── Mode marche specifique ────────────────────────────────────────────────
     if args.market:
         log.info(f"Analyse du marche : {args.market}")
         market_data = kalshi.get_market(args.market)
-
         if not market_data:
             log.warning("Donnees Kalshi non disponibles — donnees fictives utilisees")
             market_data = {
-                "ticker":     args.market,
-                "title":      f"Marche {args.market}",
-                "yes_bid":    84,
-                "no_bid":     16,
-                "volume":     8000,
+                "ticker": args.market, "title": f"Marche {args.market}",
+                "yes_bid": 84, "no_bid": 16, "volume": 8000,
                 "close_time": "2026-07-14T09:30:00Z",
-                "category":   "economic",
-                "subtitle":   "CPI June 2026",
+                "category": "economic", "subtitle": "CPI June 2026",
             }
 
-        # Recupere le contexte macro FRED automatiquement
         fred_ctx = ""
         if FRED_AVAILABLE and os.getenv("FRED_API_KEY"):
             log.info("Recuperation contexte macro FRED...")
             fred_ctx = get_macro_context(target="CPI")
 
-        # Combine contexte FRED + contexte manuel
         full_context = ""
         if fred_ctx:
             full_context += fred_ctx + "\n\n"
@@ -548,22 +607,16 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
         log.info("Lancement analyse Claude (10 phases)...")
         analysis = engine.analyse(market_data, context=full_context or args.context)
-
         if analysis:
-            print_report(args.market, analysis)
+            print_report(args.market, analysis, manager.demo, manager.risk)
             manager.save_state(analysis, args.market, cycle)
-            trade = manager.execute(market_data, analysis)
+            trade = manager.execute(market_data, analysis, trades_this_cycle)
             if trade:
                 trades_this_cycle += 1
-                log.info(
-                    f"Trade execute: {trade.get('verdict')} | "
-                    f"Edge: {trade.get('edge', 0):.1%} | "
-                    f"Position: {trade.get('taille_position', '')}"
-                )
+                log.info(f"Trade execute: {trade.get('verdict')} | Edge: {trade.get('edge', 0):.1%} | Position: {trade.get('taille_position', '')}")
         else:
             log.error("Analyse vide — aucun trade ce cycle.")
 
-    # ── Mode scan ─────────────────────────────────────────────────────────────
     elif args.scan:
         log.info("Scan des marches economiques actifs...")
         markets = kalshi.get_active_markets("economic")
@@ -572,13 +625,18 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             return 0
         log.info(f"{len(markets)} marches trouves.")
         for market in markets:
+            if not manager.demo:
+                ok, reason = manager.risk.can_trade(trades_this_cycle)
+                if not ok:
+                    log.warning(f"[RISK] Scan stoppe: {reason}")
+                    break
             ticker = market.get("ticker", "")
             log.info(f"--- Analyse: {ticker} ---")
             analysis = engine.analyse(market, context=args.context)
             if analysis:
-                print_report(ticker, analysis)
+                print_report(ticker, analysis, manager.demo, manager.risk)
                 manager.save_state(analysis, ticker, cycle)
-                trade = manager.execute(market, analysis)
+                trade = manager.execute(market, analysis, trades_this_cycle)
                 if trade:
                     trades_this_cycle += 1
             time.sleep(4)
@@ -588,52 +646,60 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(description="Kalshi Macro Alpha Engine V3")
-    parser.add_argument("--market",      type=str,   help="Ticker (ex: KXCPI-26JUN-T0.1)")
-    parser.add_argument("--scan",        action="store_true")
-    parser.add_argument("--demo",        action="store_true", default=False,
-                        help="Paper trading sans ordre reel")
-    parser.add_argument("--capital",     type=float, default=500.0)
-    parser.add_argument("--context",     type=str,   default="")
-    parser.add_argument("--loop",        action="store_true",
-                        help="Boucle automatique")
-    parser.add_argument("--interval",    type=int,   default=300,
-                        help="Secondes entre cycles (defaut: 300)")
-    parser.add_argument("--btc",         action="store_true",
-                        help="Mode BTC 15min Kalshi")
-    parser.add_argument("--btc-target",  type=float, default=0.0,
-                        help="Prix target BTC (ex: 65145.57)")
-    parser.add_argument("--btc-minutes", type=int,   default=15,
-                        help="Duree contrat BTC en minutes")
+    parser = argparse.ArgumentParser(description="Kalshi Macro Alpha Engine V3 — LIVE par defaut")
+    parser.add_argument("--market",           type=str,   help="Ticker Kalshi (ex: KXCPI-26JUN-TB3)")
+    parser.add_argument("--scan",             action="store_true")
+    parser.add_argument("--demo",             action="store_true", default=False,
+                        help="Paper trading — aucun ordre reel (defaut: LIVE)")
+    parser.add_argument("--capital",          type=float, default=500.0)
+    parser.add_argument("--context",          type=str,   default="")
+    parser.add_argument("--loop",             action="store_true")
+    parser.add_argument("--interval",         type=int,   default=300)
+    parser.add_argument("--max-daily-loss",   type=float, default=MAX_DAILY_LOSS,
+                        help=f"Stop loss journalier en $ (defaut: {MAX_DAILY_LOSS})")
+    parser.add_argument("--max-trades-cycle", type=int,   default=MAX_TRADES_CYCLE,
+                        help=f"Trades max par cycle (defaut: {MAX_TRADES_CYCLE})")
+    parser.add_argument("--btc",              action="store_true")
+    parser.add_argument("--btc-target",       type=float, default=0.0)
+    parser.add_argument("--btc-minutes",      type=int,   default=15)
     args = parser.parse_args()
 
+    mode_label = "DEMO (paper trading)" if args.demo else "LIVE — ORDRES REELS"
     print("\n" + "=" * 62)
     print("   KALSHI MACRO ALPHA ENGINE V3")
     print("=" * 62)
-    log.info(f"Mode     : {'DEMO (paper trading)' if args.demo else 'LIVE'}")
-    log.info(f"Capital  : ${args.capital:,.2f}")
-    log.info(
-        f"Boucle   : {'OUI — toutes les ' + str(args.interval // 60) + ' min' if args.loop else 'NON'}"
-    )
-    log.info(f"Kalshi   : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE — donnees fictives'}")
-    log.info(f"Claude   : {'CLE OK' if ANTHROPIC_API_KEY else 'MANQUANTE'}")
+    log.info(f"Mode          : {mode_label}")
+    log.info(f"Capital       : ${args.capital:,.2f}")
+    log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
+    log.info(f"Max trades/cyc: {args.max_trades_cycle}")
+    log.info(f"Boucle        : {'OUI' if args.loop else 'NON'}")
+    log.info(f"Kalshi        : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE'}")
+    log.info(f"Claude        : {'CLE OK' if ANTHROPIC_API_KEY else 'MANQUANTE'}")
     print("=" * 62 + "\n")
 
     if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY manquant dans .env — impossible de continuer.")
+        log.error("ANTHROPIC_API_KEY manquant dans .env")
+        sys.exit(1)
+    if not args.demo and not KALSHI_KEY_ID:
+        log.error("KALSHI_KEY_ID manquant dans .env — impossible de trader en LIVE.")
+        log.error("Ajoutez --demo pour tester sans cle Kalshi.")
+        sys.exit(1)
+    if not args.demo and not KALSHI_PRIV_KEY.strip():
+        log.error("KALSHI_PRIVATE_KEY manquant dans .env")
         sys.exit(1)
 
     if not args.market and not args.scan and not args.btc:
         parser.print_help()
         print("\nExemples :")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --capital 500 --loop")
-        print("  python kalshi_alpha_bot.py --scan --demo --loop")
+        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --loop               # LIVE")
+        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --demo --loop        # DEMO")
+        print("  python kalshi_alpha_bot.py --scan --loop --max-daily-loss 100             # LIVE scan")
         return
 
+    risk    = RiskManager(args.max_daily_loss, args.max_trades_cycle)
     kalshi  = KalshiClient(demo=args.demo)
     engine  = AlphaEngine()
-    manager = TradeManager(kalshi, args.capital, demo=args.demo)
+    manager = TradeManager(kalshi, args.capital, demo=args.demo, risk=risk)
 
     cycle, total_trades = 1, 0
     try:
@@ -641,20 +707,16 @@ def main():
             n = run_cycle(args, kalshi, engine, manager, cycle)
             total_trades += n
             print(f"\n  Cycle #{cycle} termine — {n} trade(s) — Total: {total_trades}")
-
+            if not args.demo:
+                print(f"  Perte potentielle jour: {risk.daily_loss:.2f}$ / {risk.max_daily_loss:.2f}$")
             if not args.loop:
                 log.info("Mode unique — ajoute --loop pour tourner en continu.")
                 break
-
             cycle += 1
             countdown(args.interval, cycle)
-
     except KeyboardInterrupt:
         print(f"\n\n  Arret — {cycle} cycle(s) — {total_trades} trade(s) total\n")
         log.info(f"Bot arrete proprement apres {cycle} cycles et {total_trades} trades.")
 
 
 if __name__ == "__main__":
-    main()
-
-
