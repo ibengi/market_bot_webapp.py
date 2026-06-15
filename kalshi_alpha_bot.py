@@ -229,6 +229,8 @@ class KalshiClient:
             return result
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                log.error(f"Detail Kalshi: {e.response.text}")
             return {"error": str(e)}
 
 
