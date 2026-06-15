@@ -92,8 +92,8 @@ KALSHI_BASE_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
-MIN_EDGE          = 0.08
-MIN_CONFIDENCE    = 7
+MIN_EDGE          = 0.03
+MIN_CONFIDENCE    = 4
 
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """Tu es KALSHI MACRO ALPHA ENGINE V2.
@@ -130,14 +130,14 @@ REGLES ABSOLUES :
 - Somme scenarios = exactement 100%
 - EDGE = prob_reelle - prob_marche
 - EV nette = (P_gain x gain x 0.9755) - (P_perte x perte)
-- Si edge < 8% OU confiance < 7 : verdict = AUCUN TRADE
+- Si edge < 3% OU confiance < 4 : verdict = AUCUN TRADE
 - verdict uniquement parmi : ACHETER YES / ACHETER NO / ATTENDRE / AUCUN TRADE
 - taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
 """
 
 # ── Client Kalshi RSA ─────────────────────────────────────────────────────────
 class KalshiClient:
-    def __init__(self, demo: bool = False):
+    def __init__(self, demo: bool = True):
         self.base_url = KALSHI_DEMO_URL if demo else KALSHI_BASE_URL
         self.demo     = demo
         self.session  = requests.Session()
