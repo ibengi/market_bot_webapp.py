@@ -544,7 +544,7 @@ def main():
     parser = argparse.ArgumentParser(description="Kalshi Macro Alpha Engine V3")
     parser.add_argument("--market",   type=str,   help="Ticker (ex: KXCPI-26JUN-T0.1)")
     parser.add_argument("--scan",     action="store_true")
-    parser.add_argument("--demo",     action="store_true", default=True, help="Paper trading sans ordre reel")
+    parser.add_argument("--demo",     action="store_true", default=False, help="Paper trading sans ordre reel")
     parser.add_argument("--capital",  type=float, default=500.0)
     parser.add_argument("--context",  type=str,   default="")
     parser.add_argument("--loop",     action="store_true", help="Boucle automatique")
