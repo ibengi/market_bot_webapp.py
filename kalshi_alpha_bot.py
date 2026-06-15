@@ -90,7 +90,7 @@ KALSHI_KEY_ID     = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIV_KEY   = os.getenv("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
 
 KALSHI_BASE_URL   = "https://trading-api.kalshi.com/trade-api/v2"
-KALSHI_DEMO_URL   = "https://demo-api.kalshi.com/trade-api/v2"
+KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
 MIN_EDGE          = 0.03
