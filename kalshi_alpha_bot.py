@@ -38,7 +38,7 @@ t9KYy4ZJxdlPY8VQ9KnqZhWfSTmfK4wM0QdZB/moRLTybVPOdfI=
 
 USAGE:
     python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop
-    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --capital 500 --loop
+    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --capital 100 --loop
 """
 
 import os, json, time, sys, argparse, logging, base64
