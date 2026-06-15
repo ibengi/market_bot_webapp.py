@@ -215,17 +215,19 @@ class KalshiClient:
             return {"status": "dry_run", "ticker": ticker,
                     "side": side, "count": count, "price": price}
         try:
-            payload = {
-                "ticker": ticker,
-                "client_order_id": f"alpha_{int(time.time())}",
-                "type": "limit", "action": "buy", "side": side, "count": count,
-                "yes_price": price if side == "yes" else 100 - price,
-                "no_price":  price if side == "no"  else 100 - price,
-            }
-            r = self._req("POST", "/portfolio/orders", json=payload)
-            if not r.ok:
-                log.error(f"Detail Kalshi: {r.text}")
-            r.raise_for_status()
+      payload = {
+            "ticker": ticker,
+            "client_order_id": f"alpha_{int(time.time())}",
+            "type": "limit", "action": "buy", "side": side, "count": count,
+        }
+        if side == "yes":
+            payload["yes_price"] = price
+        else:
+            payload["no_price"] = 100 - price
+        r = self._req("POST", "/portfolio/orders", json=payload)
+        if not r.ok:
+            log.error(f"Detail Kalshi: {r.text}")
+        r.raise_for_status()
             result = r.json()
             log.info(f"ORDER PLACED: {result}")
             return result
@@ -233,7 +235,10 @@ class KalshiClient:
             log.error(f"Erreur place_order: {e}")
             if hasattr(e, 'response') and e.response is not None:
                 log.error(f"Detail Kalshi: {e.response.text}")
-            return {"error": str(e)}
+            return {"error": str(e)} if side == "yes":
+    payload["yes_price"] = price
+else:
+    payload["no_price"] = 100 - price
 
 
 # ── Moteur Claude avec retry ──────────────────────────────────────────────────
