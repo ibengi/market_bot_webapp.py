@@ -209,7 +209,7 @@ class KalshiClient:
 
     def place_order(self, ticker: str, side: str, count: int,
                     price: int, dry_run: bool = True) -> dict:
-        if dry_run or self.demo:
+        if dry_run:
             log.info(f"[DRY RUN] {side.upper()} {count}x {ticker} @ {price}c")
             return {"status": "dry_run", "ticker": ticker,
                     "side": side, "count": count, "price": price}
