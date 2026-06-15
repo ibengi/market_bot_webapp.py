@@ -568,7 +568,7 @@ def main():
         log.error("ANTHROPIC_API_KEY manquant dans .env — impossible de continuer.")
         sys.exit(1)
 
-    if not args.market and not args.scan:
+    if not args.market and not args.scan and not args.btc:
         parser.print_help()
         print("\nExemples :")
         print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop")
