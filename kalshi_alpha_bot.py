@@ -223,6 +223,8 @@ class KalshiClient:
                 "no_price":  price if side == "no"  else 100 - price,
             }
             r = self._req("POST", "/portfolio/orders", json=payload)
+            if not r.ok:
+                log.error(f"Detail Kalshi: {r.text}")
             r.raise_for_status()
             result = r.json()
             log.info(f"ORDER PLACED: {result}")
