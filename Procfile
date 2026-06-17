@@ -1,1 +1,1 @@
-worker: python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --loop
+worker: python kalshi_alpha_bot.py --market KXWCGAME-26JUN17PORCOD-POR --soccer --demo --loop
