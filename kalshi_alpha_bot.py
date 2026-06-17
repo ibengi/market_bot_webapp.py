@@ -36,10 +36,12 @@ gRBpqUqbOBxClhWQh6LvRjQYUjpxYg77HnBGFk88vQCXhjxX8QNaTRqIp8oDdkHX
 hfR8Z8VxNnxHQoUM5ICzhHd2/k1IAAXv4CCMyXj8DeKQi47NIK8=
 -----END RSA PRIVATE KEY-----
 USAGE:
-    python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --loop              # LIVE
-    python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --demo --loop       # DEMO
-    python kalshi_alpha_bot.py --scan --loop                                # LIVE scan
-    python kalshi_alpha_bot.py --btc --loop                                 # LIVE BTC 15min
+    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --loop              # LIVE macro
+    python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop       # DEMO macro
+    python kalshi_alpha_bot.py --market KXEPLGAME-XXX --soccer --demo --loop # DEMO soccer
+    python kalshi_alpha_bot.py --scan --soccer --demo --loop                 # DEMO soccer scan
+    python kalshi_alpha_bot.py --scan --loop                                 # LIVE scan macro
+    python kalshi_alpha_bot.py --btc --loop                                  # LIVE BTC 15min
 """
 
 import os, json, time, sys, argparse, logging, base64
@@ -103,8 +105,8 @@ MIN_CONFIDENCE    = 4
 MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
 
-# ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """Tu es KALSHI MACRO ALPHA ENGINE V2.
+# ── System prompt (Macro/CPI) ────────────────────────────────────────────────
+SYSTEM_PROMPT_MACRO = """Tu es KALSHI MACRO ALPHA ENGINE V2.
 Mission unique : Detecter les erreurs de prix et identifier les trades a EV positive.
 JAMAIS : Predire. Avoir raison. Trader par intuition.
 
@@ -139,6 +141,58 @@ REGLES ABSOLUES :
 - EDGE = prob_reelle - prob_marche
 - EV nette = (P_gain x gain x 0.9755) - (P_perte x perte)
 - Si edge < 3% OU confiance < 4 : verdict = AUCUN TRADE
+- verdict uniquement parmi : ACHETER YES / ACHETER NO / ATTENDRE / AUCUN TRADE
+- taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
+"""
+
+# ── System prompt (Soccer / resultat de match) ───────────────────────────────
+SYSTEM_PROMPT_SOCCER = """Tu es KALSHI SOCCER ALPHA ENGINE.
+Mission unique : Detecter les erreurs de prix sur des marches de resultat de match
+de football/soccer (1X2 -- qui gagne) et identifier les trades a EV positive.
+JAMAIS : Predire par intuition ou supporterisme. Toujours raisonner par les faits
+disponibles (forme recente, contexte du match, enjeux, compositions probables,
+historique des confrontations, fatigue/calendrier, lieu du match).
+
+Tu n'as PAS acces a une API de stats sportives en temps reel : base ton analyse sur
+ta connaissance generale des equipes/joueurs/competitions et sur le contexte fourni
+(prix de marche Kalshi, volume, titre du marche, date du match). Si tu ne connais pas
+suffisamment les deux equipes pour juger, reduis fortement ta confiance plutot que
+d'inventer des informations.
+
+Reponds UNIQUEMENT en JSON valide (aucun markdown, aucun backtick) :
+
+{
+  "phase1": {"match":"","competition":"","enjeu":"","prob_implicite_yes":0.0,"prob_implicite_no":0.0,"incoherence_detectee":false},
+  "phase2": {"forme_equipe_yes":"","forme_equipe_no":"","historique_confrontations":"","blessures_suspensions":""},
+  "phase3": {"contexte_match":"","lieu_avantage":"","enjeu_sportif":"","fatigue_calendrier":""},
+  "phase4": {"prix_marche_actuel":0.0,"volume_marche":0,"liquidite_suffisante":true},
+  "phase5": {"scenarios":[
+    {"nom":"victoire_yes","probabilite":0.0,"declencheur":""},
+    {"nom":"victoire_no","probabilite":0.0,"declencheur":""},
+    {"nom":"nul_ou_incertain","probabilite":0.0,"declencheur":""}
+  ],"somme":0.0},
+  "phase6": {"prob_reelle":0.0,"prob_marche":0.0,"edge":0.0,"grade":""},
+  "phase7": {"argument_pour_yes":"","argument_pour_no":"","argument_market_maker":"","argument_risk_manager":"","edge_tient":true},
+  "phase8": {"gain_potentiel":0.0,"perte_potentielle":0.0,"ev_brute":0.0,"ev_nette":0.0,"qualification":""},
+  "phase9": {"qualite_donnees":0,"confiance_statistique":0,"risque":0,"volatilite_score":0,"edge_score":0,"score_composite":0.0},
+  "phase10": {
+    "verdict":"",
+    "prob_reelle":0.0,"prob_marche":0.0,"edge":0.0,
+    "ev_brute":0.0,"ev_nette":0.0,
+    "confiance":0,"risque":0,"grade":"",
+    "raison_principale":"","risque_principal":"","risque_exogene":"",
+    "taille_position":""
+  }
+}
+
+REGLES ABSOLUES :
+- Somme scenarios = exactement 100%
+- EDGE = prob_reelle - prob_marche
+- EV nette = (P_gain x gain x 0.9755) - (P_perte x perte)
+- Si edge < 5% OU confiance < 5 : verdict = AUCUN TRADE (seuil plus strict que macro car
+  le sport a une variance intrinseque plus elevee qu'un indicateur economique)
+- Si liquidite_suffisante = false : verdict = AUCUN TRADE (impossible de sortir la position)
+- Si tu ne connais pas suffisamment les deux equipes : confiance <= 3 et verdict = AUCUN TRADE
 - verdict uniquement parmi : ACHETER YES / ACHETER NO / ATTENDRE / AUCUN TRADE
 - taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
 """
@@ -348,12 +402,34 @@ class KalshiClient:
 
 # ── Moteur Claude avec retry ──────────────────────────────────────────────────
 class AlphaEngine:
-    def __init__(self):
+    def __init__(self, mode: str = "macro"):
         self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.mode   = mode  # "macro" ou "soccer"
 
     def analyse(self, market_data: dict, context: str = "",
                 retries: int = 3, delay: int = 5) -> dict:
-        prompt = f"""
+        if self.mode == "soccer":
+            system_prompt = SYSTEM_PROMPT_SOCCER
+            prompt = f"""
+MATCH A ANALYSER :
+- Ticker     : {market_data.get('ticker', 'N/A')}
+- Titre      : {market_data.get('title', 'N/A')}
+- Sous-titre : {market_data.get('subtitle', 'N/A')}
+- Prix YES   : {market_data.get('yes_bid', 50)} cents
+- Prix NO    : {market_data.get('no_bid', 50)} cents
+- Volume     : {market_data.get('volume', 0)}
+- Cloture    : {market_data.get('close_time', 'N/A')}
+- Categorie  : {market_data.get('category', 'N/A')}
+
+CONTEXTE ADDITIONNEL :
+{context or 'Aucun contexte supplementaire fourni -- base-toi sur ta connaissance des equipes/competition.'}
+
+Lance l'analyse complete en 10 phases pour ce marche de resultat de match.
+Reponds uniquement en JSON valide.
+"""
+        else:
+            system_prompt = SYSTEM_PROMPT_MACRO
+            prompt = f"""
 MARCHE A ANALYSER :
 - Ticker    : {market_data.get('ticker', 'N/A')}
 - Titre     : {market_data.get('title', 'N/A')}
@@ -373,7 +449,7 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
                 resp = self.client.messages.create(
                     model="claude-sonnet-4-6",
                     max_tokens=4000,
-                    system=SYSTEM_PROMPT,
+                    system=system_prompt,
                     messages=[{"role": "user", "content": prompt}],
                 )
                 raw = resp.content[0].text.strip()
@@ -397,11 +473,12 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 # ── Gestionnaire de trades ────────────────────────────────────────────────────
 class TradeManager:
     def __init__(self, kalshi: KalshiClient, capital: float,
-                 demo: bool, risk: RiskManager):
+                 demo: bool, risk: RiskManager, mode: str = "macro"):
         self.kalshi  = kalshi
         self.capital = capital
         self.demo    = demo
         self.risk    = risk
+        self.mode    = mode
         self.trades  = []
 
     def compute_contracts(self, taille_pct: str, price_cents: int) -> int:
@@ -419,13 +496,24 @@ class TradeManager:
         taille    = p10.get("taille_position", "0%")
         ticker    = market_data.get("ticker", "?")
 
+        # Seuils plus stricts pour le sport (variance intrinseque plus elevee)
+        min_edge       = 0.05 if self.mode == "soccer" else MIN_EDGE
+        min_confidence = 5    if self.mode == "soccer" else MIN_CONFIDENCE
+
         if verdict == "AUCUN TRADE":
             log.info(f"[{ticker}] AUCUN TRADE -- edge={edge:.1%} conf={confiance}/10")
             return None
 
-        if edge < MIN_EDGE or confiance < MIN_CONFIDENCE:
+        if edge < min_edge or confiance < min_confidence:
             log.warning(f"[{ticker}] BLOQUE -- edge={edge:.1%} conf={confiance}/10")
             return None
+
+        # Filtre liquidite specifique soccer (marches sportifs souvent illiquides)
+        if self.mode == "soccer":
+            volume = market_data.get("volume", 0)
+            if volume < 100:
+                log.warning(f"[{ticker}] BLOQUE -- volume insuffisant ({volume})")
+                return None
 
         if verdict == "ACHETER YES":
             side, price = "yes", int(market_data.get("yes_bid", 50))
@@ -455,6 +543,7 @@ class TradeManager:
         trade_log = {
             "timestamp":       datetime.now().isoformat(),
             "mode":            "DEMO" if self.demo else "LIVE",
+            "market_type":     self.mode,
             "ticker":          ticker,
             "verdict":         verdict,
             "side":            side,
@@ -634,27 +723,42 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
         if not market_data:
             log.warning("Donnees Kalshi non disponibles -- donnees fictives utilisees")
-            market_data = {
-                "ticker":     args.market,
-                "title":      f"Marche {args.market}",
-                "yes_bid":    84,
-                "no_bid":     16,
-                "volume":     8000,
-                "close_time": "2026-07-14T09:30:00Z",
-                "category":   "economic",
-                "subtitle":   "CPI June 2026",
-            }
-
-        fred_ctx = ""
-        if FRED_AVAILABLE and os.getenv("FRED_API_KEY"):
-            log.info("Recuperation contexte macro FRED...")
-            fred_ctx = get_macro_context(target="CPI")
+            if manager.mode == "soccer":
+                market_data = {
+                    "ticker":     args.market,
+                    "title":      f"Match {args.market}",
+                    "yes_bid":    50,
+                    "no_bid":     50,
+                    "volume":     0,
+                    "close_time": "N/A",
+                    "category":   "soccer",
+                    "subtitle":   "Donnees indisponibles",
+                }
+            else:
+                market_data = {
+                    "ticker":     args.market,
+                    "title":      f"Marche {args.market}",
+                    "yes_bid":    84,
+                    "no_bid":     16,
+                    "volume":     8000,
+                    "close_time": "2026-07-14T09:30:00Z",
+                    "category":   "economic",
+                    "subtitle":   "CPI June 2026",
+                }
 
         full_context = ""
-        if fred_ctx:
-            full_context += fred_ctx + "\n\n"
-        if args.context:
-            full_context += "CONTEXTE ADDITIONNEL: " + args.context
+        if manager.mode == "soccer":
+            if args.context:
+                full_context = "CONTEXTE ADDITIONNEL: " + args.context
+        else:
+            fred_ctx = ""
+            if FRED_AVAILABLE and os.getenv("FRED_API_KEY"):
+                log.info("Recuperation contexte macro FRED...")
+                fred_ctx = get_macro_context(target="CPI")
+            if fred_ctx:
+                full_context += fred_ctx + "\n\n"
+            if args.context:
+                full_context += "CONTEXTE ADDITIONNEL: " + args.context
 
         log.info("Lancement analyse Claude (10 phases)...")
         analysis = engine.analyse(market_data, context=full_context or args.context)
@@ -675,10 +779,11 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
     # ── Mode scan ─────────────────────────────────────────────────────────────
     elif args.scan:
-        log.info("Scan des marches economiques actifs...")
-        markets = kalshi.get_active_markets("economic")
+        scan_category = "KXEPLGAME" if manager.mode == "soccer" else "economic"
+        log.info(f"Scan des marches actifs ({scan_category})...")
+        markets = kalshi.get_active_markets(scan_category)
         if not markets:
-            log.warning("Aucun marche trouve -- verifie KALSHI_KEY_ID dans .env")
+            log.warning("Aucun marche trouve -- verifie KALSHI_KEY_ID dans .env ou le series_ticker")
             return 0
         log.info(f"{len(markets)} marches trouves.")
         for market in markets:
@@ -704,8 +809,10 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Macro Alpha Engine V3")
-    parser.add_argument("--market",           type=str,   help="Ticker Kalshi (ex: KXCPI-26JUN-TB3)")
+    parser.add_argument("--market",           type=str,   help="Ticker Kalshi (ex: KXEPLGAME-... ou KXCPI-26JUN-T0.1)")
     parser.add_argument("--scan",             action="store_true", help="Scan tous les marches economiques")
+    parser.add_argument("--soccer",           action="store_true",
+                        help="Mode soccer : analyse resultat de match (1X2) au lieu du mode macro")
     parser.add_argument("--demo",             action="store_true", default=False,
                         help="Paper trading -- aucun ordre reel (defaut: LIVE)")
     parser.add_argument("--capital",          type=float, default=500.0)
@@ -723,12 +830,14 @@ def main():
     args = parser.parse_args()
 
     mode_label = "DEMO (paper trading)" if args.demo else "LIVE -- ORDRES REELS"
+    market_mode = "soccer" if args.soccer else "macro"
     sep = "=" * 62
 
     print("\n" + sep)
     print("   KALSHI MACRO ALPHA ENGINE V3")
     print(sep)
     log.info(f"Mode          : {mode_label}")
+    log.info(f"Type marche   : {'SOCCER (resultat de match)' if args.soccer else 'MACRO (economique)'}")
     log.info(f"Capital       : ${args.capital:,.2f}")
     log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
     log.info(f"Max trades/cyc: {args.max_trades_cycle}")
@@ -753,15 +862,16 @@ def main():
     if not args.market and not args.scan and not args.btc:
         parser.print_help()
         print("\nExemples :")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --loop               # LIVE")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-TB3 --demo --loop        # DEMO")
-        print("  python kalshi_alpha_bot.py --scan --loop --max-daily-loss 100             # LIVE scan")
+        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --loop                  # LIVE macro")
+        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop           # DEMO macro")
+        print("  python kalshi_alpha_bot.py --market KXEPLGAME-XXX --soccer --demo --loop     # DEMO soccer")
+        print("  python kalshi_alpha_bot.py --scan --loop --max-daily-loss 100                # LIVE scan")
         return
 
     risk    = RiskManager(args.max_daily_loss, args.max_trades_cycle)
     kalshi  = KalshiClient(demo=args.demo)
-    engine  = AlphaEngine()
-    manager = TradeManager(kalshi, args.capital, demo=args.demo, risk=risk)
+    engine  = AlphaEngine(mode=market_mode)
+    manager = TradeManager(kalshi, args.capital, demo=args.demo, risk=risk, mode=market_mode)
 
     cycle, total_trades = 1, 0
     try:
