@@ -331,13 +331,53 @@ class KalshiClient:
             method.upper(), self.base_url + path, headers=headers, timeout=15, **kw
         )
 
+    @staticmethod
+    def _normalize_market(m: dict) -> dict:
+        """
+        Normalise les champs Kalshi qui ont change de format au fil des versions API :
+        - yes_bid / yes_bid_dollars (dollars en string, ex "0.5600" -> 56 cents)
+        - no_bid  / no_bid_dollars
+        - volume  / volume_fp (peut etre une string numerique)
+        Garantit que 'yes_bid', 'no_bid' et 'volume' existent toujours avec
+        des types numeriques utilisables par le reste du bot.
+        """
+        if not m:
+            return m
+
+        def to_cents(dollars_str, fallback_cents):
+            if dollars_str is None:
+                return fallback_cents
+            try:
+                return int(round(float(dollars_str) * 100))
+            except (TypeError, ValueError):
+                return fallback_cents
+
+        def to_number(value, fallback=0):
+            if value is None:
+                return fallback
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        m = dict(m)  # copie pour ne pas muter l'original
+
+        if "yes_bid" not in m or m.get("yes_bid") is None:
+            m["yes_bid"] = to_cents(m.get("yes_bid_dollars"), 50)
+        if "no_bid" not in m or m.get("no_bid") is None:
+            m["no_bid"] = to_cents(m.get("no_bid_dollars"), 50)
+        if "volume" not in m or m.get("volume") is None:
+            m["volume"] = to_number(m.get("volume_fp"), 0)
+
+        return m
+
     def get_market(self, ticker: str) -> dict:
         if not KALSHI_KEY_ID:
             return {}
         try:
             r = self._req("GET", f"/markets/{ticker}")
             r.raise_for_status()
-            return r.json().get("market", {})
+            return self._normalize_market(r.json().get("market", {}))
         except Exception as e:
             log.error(f"Erreur get_market({ticker}): {e}")
             return {}
@@ -349,7 +389,8 @@ class KalshiClient:
             r = self._req("GET", "/markets",
                           params={"status": "open", "series_ticker": category, "limit": 50})
             r.raise_for_status()
-            return r.json().get("markets", [])
+            markets = r.json().get("markets", [])
+            return [self._normalize_market(m) for m in markets]
         except Exception as e:
             log.error(f"Erreur get_active_markets: {e}")
             return []
@@ -508,9 +549,9 @@ class TradeManager:
             log.warning(f"[{ticker}] BLOQUE -- edge={edge:.1%} conf={confiance}/10")
             return None
 
-        # Filtre liquidite specifique soccer (marches sportifs souvent illiquides)
+        # Filtre liquidite specifique soccer (marches sportifs parfois illiquides)
         if self.mode == "soccer":
-            volume = market_data.get("volume", 0)
+            volume = market_data.get("volume", 0) or 0
             if volume < 100:
                 log.warning(f"[{ticker}] BLOQUE -- volume insuffisant ({volume})")
                 return None
@@ -779,11 +820,15 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
     # ── Mode scan ─────────────────────────────────────────────────────────────
     elif args.scan:
-        scan_category = "KXEPLGAME" if manager.mode == "soccer" else "economic"
-        log.info(f"Scan des marches actifs ({scan_category})...")
+        default_series = "KXWCGAME" if manager.mode == "soccer" else "economic"
+        scan_category = getattr(args, "series", "") or default_series
+        log.info(f"Scan des marches actifs (serie: {scan_category})...")
         markets = kalshi.get_active_markets(scan_category)
         if not markets:
-            log.warning("Aucun marche trouve -- verifie KALSHI_KEY_ID dans .env ou le series_ticker")
+            log.warning(
+                f"Aucun marche trouve pour la serie '{scan_category}' -- "
+                f"verifie KALSHI_KEY_ID dans .env, ou essaie --series KXWC, --series KXWCWIN, etc."
+            )
             return 0
         log.info(f"{len(markets)} marches trouves.")
         for market in markets:
@@ -813,6 +858,8 @@ def main():
     parser.add_argument("--scan",             action="store_true", help="Scan tous les marches economiques")
     parser.add_argument("--soccer",           action="store_true",
                         help="Mode soccer : analyse resultat de match (1X2) au lieu du mode macro")
+    parser.add_argument("--series",           type=str,   default="",
+                        help="Series Kalshi a scanner (ex: KXWC, KXEPLGAME). Defaut: KXEPLGAME en mode soccer")
     parser.add_argument("--demo",             action="store_true", default=False,
                         help="Paper trading -- aucun ordre reel (defaut: LIVE)")
     parser.add_argument("--capital",          type=float, default=500.0)
