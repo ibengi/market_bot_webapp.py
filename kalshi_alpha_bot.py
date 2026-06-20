@@ -398,10 +398,17 @@ class KalshiClient:
     def place_order(self, ticker: str, side: str, count: int,
                     price: int, dry_run: bool = False) -> dict:
         """
-        Envoie un ordre sur Kalshi.
+        Envoie un ordre sur Kalshi via l'endpoint V2 (/portfolio/events/orders).
         dry_run=True  -> simulation locale uniquement (aucun appel API).
         dry_run=False -> ordre reel envoye a l'API (live ou demo selon base_url).
-        Le payload n'envoie JAMAIS yes_price et no_price simultanement.
+
+        L'ancien endpoint /portfolio/orders avec yes_price/no_price (cents, int)
+        a ete deprecie par Kalshi (HTTP 410 deprecated_v1_order_endpoint).
+        Le format V2 utilise :
+          - book_side "bid" (acheteur) systematiquement pour un achat
+          - outcome_side "yes" ou "no" pour indiquer quel cote du contrat
+          - price en dollars (string, ex: "0.5600") au lieu de cents (int)
+          - count en string fixed-point (ex: "20.00")
         """
         if dry_run:
             log.info(f"[DRY RUN] {side.upper()} {count}x {ticker} @ {price}c")
@@ -413,20 +420,18 @@ class KalshiClient:
                 "price":  price,
             }
         try:
+            price_dollars = f"{price / 100:.4f}"
             payload = {
-                "ticker":          ticker,
-                "client_order_id": f"alpha_{int(time.time())}",
-                "type":            "limit",
-                "action":          "buy",
-                "side":            side,
-                "count":           count,
+                "ticker":             ticker,
+                "client_order_id":    f"alpha_{int(time.time())}",
+                "side":               "bid",          # on est toujours acheteur (buy)
+                "outcome_side":       side,            # "yes" ou "no"
+                "count":              f"{count:.2f}",
+                "price":              price_dollars,
+                "time_in_force":      "good_till_canceled",
             }
-            if side == "yes":
-                payload["yes_price"] = price
-            else:
-                payload["no_price"] = 100 - price
 
-            r = self._req("POST", "/portfolio/orders", json=payload)
+            r = self._req("POST", "/portfolio/events/orders", json=payload)
             if not r.ok:
                 log.error(f"Detail Kalshi HTTP {r.status_code}: {r.text}")
             r.raise_for_status()
@@ -831,6 +836,10 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             )
             return 0
         log.info(f"{len(markets)} marches trouves.")
+        max_m = getattr(args, "max_markets", 0)
+        if max_m > 0:
+            markets = markets[:max_m]
+            log.info(f"Limite appliquee : {max_m} marches analyses ce cycle.")
         for market in markets:
             if not manager.demo:
                 ok, reason = manager.risk.can_trade(trades_this_cycle)
@@ -859,7 +868,9 @@ def main():
     parser.add_argument("--soccer",           action="store_true",
                         help="Mode soccer : analyse resultat de match (1X2) au lieu du mode macro")
     parser.add_argument("--series",           type=str,   default="",
-                        help="Series Kalshi a scanner (ex: KXWC, KXEPLGAME). Defaut: KXEPLGAME en mode soccer")
+                        help="Series Kalshi a scanner (ex: KXWC, KXEPLGAME). Defaut: KXWCGAME en mode soccer")
+    parser.add_argument("--max-markets",     type=int,   default=0,
+                        help="Nombre max de marches analyses par scan (0 = tous, defaut: 0)")
     parser.add_argument("--demo",             action="store_true", default=False,
                         help="Paper trading -- aucun ordre reel (defaut: LIVE)")
     parser.add_argument("--capital",          type=float, default=500.0)
