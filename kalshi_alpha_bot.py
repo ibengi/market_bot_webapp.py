@@ -422,13 +422,14 @@ class KalshiClient:
         try:
             price_dollars = f"{price / 100:.4f}"
             payload = {
-                "ticker":             ticker,
-                "client_order_id":    f"alpha_{int(time.time())}",
-                "side":               "bid",          # on est toujours acheteur (buy)
-                "outcome_side":       side,            # "yes" ou "no"
-                "count":              f"{count:.2f}",
-                "price":              price_dollars,
-                "time_in_force":      "good_till_canceled",
+                "ticker":                    ticker,
+                "client_order_id":           f"alpha_{int(time.time())}",
+                "side":                      "bid",          # on est toujours acheteur (buy)
+                "outcome_side":              side,            # "yes" ou "no"
+                "count":                     f"{count:.2f}",
+                "price":                     price_dollars,
+                "time_in_force":             "good_till_canceled",
+                "self_trade_prevention_type": "taker_at_cross",
             }
 
             r = self._req("POST", "/portfolio/events/orders", json=payload)
