@@ -520,13 +520,15 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 # ── Gestionnaire de trades ────────────────────────────────────────────────────
 class TradeManager:
     def __init__(self, kalshi: KalshiClient, capital: float,
-                 demo: bool, risk: RiskManager, mode: str = "macro"):
-        self.kalshi  = kalshi
-        self.capital = capital
-        self.demo    = demo
-        self.risk    = risk
-        self.mode    = mode
-        self.trades  = []
+                 demo: bool, risk: RiskManager, mode: str = "macro",
+                 btc_min_edge: float = 0.04):
+        self.kalshi       = kalshi
+        self.capital      = capital
+        self.demo         = demo
+        self.risk         = risk
+        self.mode         = mode
+        self.btc_min_edge = btc_min_edge
+        self.trades       = []
 
     def compute_contracts(self, taille_pct: str, price_cents: int) -> int:
         pct = {"0.5%": .005, "1%": .01, "2%": .02, "5%": .05, "10%": .10}.get(taille_pct, .01)
@@ -543,9 +545,17 @@ class TradeManager:
         taille    = p10.get("taille_position", "0%")
         ticker    = market_data.get("ticker", "?")
 
-        # Seuils plus stricts pour le sport (variance intrinseque plus elevee)
-        min_edge       = 0.05 if self.mode == "soccer" else MIN_EDGE
-        min_confidence = 5    if self.mode == "soccer" else MIN_CONFIDENCE
+        # Seuils adaptes par type de marche :
+        # - soccer : plus stricts (variance intrinseque elevee, peu de donnees fiables)
+        # - btc    : edge configurable (--btc-min-edge), confiance min plus basse
+        #            car le modele mathematique est calibre differemment de
+        #            Claude (echelle 1-10 mais distribution differente)
+        if self.mode == "soccer":
+            min_edge, min_confidence = 0.05, 5
+        elif self.mode == "btc":
+            min_edge, min_confidence = getattr(self, "btc_min_edge", 0.04), 3
+        else:
+            min_edge, min_confidence = MIN_EDGE, MIN_CONFIDENCE
 
         if verdict == "AUCUN TRADE":
             log.info(f"[{ticker}] AUCUN TRADE -- edge={edge:.1%} conf={confiance}/10")
@@ -1002,7 +1012,8 @@ def main():
     risk    = RiskManager(args.max_daily_loss, args.max_trades_cycle)
     kalshi  = KalshiClient(demo=args.demo)
     engine  = AlphaEngine(mode=market_mode)
-    manager = TradeManager(kalshi, args.capital, demo=args.demo, risk=risk, mode=market_mode)
+    manager = TradeManager(kalshi, args.capital, demo=args.demo, risk=risk,
+                           mode=market_mode, btc_min_edge=args.btc_min_edge)
 
     cycle, total_trades = 1, 0
     try:

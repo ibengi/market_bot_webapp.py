@@ -289,10 +289,20 @@ def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
         verdict = "AUCUN TRADE"
         edge    = max(edge_yes, edge_no)
 
-    # Confiance basee sur la distance au strike par rapport a la volatilite
-    # (plus le prix est loin du strike relativement a la vol, plus on est confiant)
-    distance_sigma = abs(math.log(price / strike_price)) / max(vol, 0.0001)
-    confiance = min(10, max(1, int(distance_sigma * 3)))
+    # Confiance basee sur |d2| (distance au strike normalisee par la vol ET
+    # le temps restant -- meme echelle que le calcul de probabilite ci-dessus).
+    # BUG CORRIGE : l'ancienne version utilisait la volatilite brute sans la
+    # mettre a l'echelle du temps restant, ce qui rendait le modele
+    # systematiquement trop prudent en toute fin de fenetre (la ou il devrait
+    # au contraire etre le plus confiant, puisqu'il reste tres peu de temps
+    # pour que le prix s'eloigne du strike).
+    t_scaled = max(minutes_remaining / 15.0, 0.01)
+    sigma_scaled = max(vol, 0.0001) * math.sqrt(t_scaled)
+    try:
+        d2 = abs(math.log(price / strike_price) - 0.5 * vol**2 * t_scaled) / sigma_scaled
+    except (ValueError, ZeroDivisionError):
+        d2 = 0.0
+    confiance = min(10, max(1, int(d2 * 3)))
 
     return {
         "verdict":           verdict,
