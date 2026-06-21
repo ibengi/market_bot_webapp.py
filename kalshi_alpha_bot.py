@@ -732,35 +732,93 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             log.warning(f"[RISK] Cycle bloque: {reason}")
             return 0
 
-    # ── Mode BTC 15min ───────────────────────────────────────────────────────
+    # ── Mode BTC 15min (moteur mathematique, ZERO appel Claude) ──────────────
+    # Sur une fenetre de 15min, un appel Claude (30-45s) rend le prix obsolete
+    # avant meme que l'ordre parte. La decision utilise donc un modele
+    # Black-Scholes binaire calcule instantanement (voir btc_context.py).
+    # Claude n'intervient pas dans cette boucle -- cout API ~nul sur ce mode.
+    #
+    # Le ticker change a chaque fenetre de 15min (ex: KXBTC15M-26APR221830-T105000),
+    # donc plutot que de le construire/deviner manuellement (risque d'erreur de
+    # fuseau horaire), on liste les marches actifs de la serie KXBTC15M et on
+    # choisit celui dont la cloture est la plus proche dans le temps -- c'est
+    # le marche "courant" sur lequel trader.
     if getattr(args, "btc", False) and BTC_AVAILABLE:
-        btc_price = get_btc_price()
-        target    = getattr(args, "btc_target", 0) or (btc_price or 65000)
-        minutes   = getattr(args, "btc_minutes", 15)
-        log.info(f"Mode BTC {minutes}min | Prix: ${btc_price:,.2f} | Target: ${target:,.2f}")
+        from btc_context import evaluate_btc_trade
+        from datetime import datetime as _dt, timezone as _tz
 
-        btc_ctx = get_btc_context(target_price=target, minutes=minutes)
-        ticker  = f"KXBTC{minutes}M"
-        market_data = {
-            "ticker":     ticker,
-            "title":      f"BTC {minutes}min > ${target:,.2f}",
-            "yes_bid":    50,
-            "no_bid":     50,
-            "volume":     50000,
-            "close_time": "dans 15 minutes",
-            "category":   "crypto",
-            "subtitle":   f"BTC actuel ${btc_price:,.2f}",
-        }
-        log.info("Lancement analyse BTC Claude (10 phases)...")
-        analysis = engine.analyse(market_data, context=btc_ctx)
-        if analysis:
-            print_report(ticker, analysis, manager.demo, manager.risk)
-            manager.save_state(analysis, ticker, cycle)
-            trade = manager.execute(market_data, analysis, trades_this_cycle)
-            if trade:
-                trades_this_cycle += 1
+        manual_ticker = getattr(args, "btc_ticker", "")
+
+        if manual_ticker:
+            market_data = kalshi.get_market(manual_ticker)
+            if not market_data:
+                log.warning(f"Marche BTC '{manual_ticker}' introuvable.")
+                return 0
         else:
-            log.error("Analyse BTC vide.")
+            candidates = kalshi.get_active_markets("KXBTC15M")
+            if not candidates:
+                log.warning(
+                    "Aucun marche KXBTC15M actif trouve -- verifie KALSHI_KEY_ID, "
+                    "ou precise --btc-ticker manuellement."
+                )
+                return 0
+
+            now_dt = _dt.now(_tz.utc)
+            best, best_delta = None, None
+            for m in candidates:
+                ct = m.get("close_time")
+                if not ct:
+                    continue
+                try:
+                    close_dt = _dt.fromisoformat(ct.replace("Z", "+00:00"))
+                except Exception:
+                    continue
+                delta = (close_dt - now_dt).total_seconds()
+                if delta <= 0:
+                    continue  # deja clos, ignore
+                if best_delta is None or delta < best_delta:
+                    best, best_delta = m, delta
+
+            if best is None:
+                log.warning("Aucun marche KXBTC15M avec close_time futur trouve.")
+                return 0
+
+            market_data = best
+
+        ticker = market_data.get("ticker", manual_ticker or "KXBTC15M")
+        strike = market_data.get("floor_strike") or market_data.get("strike_price") \
+                 or getattr(args, "btc_target", 0)
+        if not strike:
+            log.warning(f"Strike introuvable pour '{ticker}' -- impossible d'evaluer.")
+            return 0
+
+        close_time = market_data.get("close_time")
+        minutes_remaining = getattr(args, "btc_minutes", 15)
+        if close_time:
+            try:
+                close_dt = _dt.fromisoformat(close_time.replace("Z", "+00:00"))
+                now_dt2  = _dt.now(_tz.utc)
+                minutes_remaining = max((close_dt - now_dt2).total_seconds() / 60.0, 0.1)
+            except Exception:
+                pass
+
+        result = evaluate_btc_trade(
+            strike_price=float(strike),
+            market_yes_price_cents=int(market_data.get("yes_bid", 50)),
+            minutes_remaining=minutes_remaining,
+            min_edge=getattr(args, "btc_min_edge", 0.04),
+        )
+        analysis = {"phase10": result, "phase8": {}, "phase9": {}, "phase5": {}}
+
+        log.info(
+            f"[BTC] {ticker} | strike=${float(strike):,.2f} | "
+            f"t_restant={minutes_remaining:.1f}min | {result['raison_principale']}"
+        )
+        print_report(ticker, analysis, manager.demo, manager.risk)
+        manager.save_state(analysis, ticker, cycle)
+        trade = manager.execute(market_data, analysis, trades_this_cycle)
+        if trade:
+            trades_this_cycle += 1
         return trades_this_cycle
 
     # ── Mode marche specifique ────────────────────────────────────────────────
@@ -884,23 +942,37 @@ def main():
     parser.add_argument("--max-trades-cycle", type=int,   default=MAX_TRADES_CYCLE,
                         help=f"Trades max par cycle (defaut: {MAX_TRADES_CYCLE})")
     parser.add_argument("--btc",              action="store_true", help="Mode BTC 15min Kalshi")
-    parser.add_argument("--btc-target",       type=float, default=0.0, help="Prix target BTC")
+    parser.add_argument("--btc-target",       type=float, default=0.0, help="Prix target BTC (fallback si strike API absent)")
     parser.add_argument("--btc-minutes",      type=int,   default=15,  help="Duree contrat BTC en minutes")
+    parser.add_argument("--btc-ticker",       type=str,   default="",
+                        help="Ticker exact du marche BTC (ex: KXBTC15M-26JUN1814:00). Sans -- doit etre fourni car le ticker change a chaque fenetre de 15min.")
+    parser.add_argument("--btc-min-edge",     type=float, default=0.04,
+                        help="Edge minimum pour trader en mode BTC (defaut: 4%%)")
     args = parser.parse_args()
 
+    # Mode BTC : marche se renouvelle toutes les 15min, un cycle de 5min (defaut)
+    # est trop lent et laisse trop de temps mort entre deux observations.
+    # Si l'utilisateur n'a pas explicitement choisi --interval, on bascule
+    # automatiquement sur un rythme plus serre (60s) en mode --btc.
+    if args.btc and args.interval == 300:
+        args.interval = 60
+        log.info("Mode BTC detecte -- intervalle ajuste automatiquement a 60s "
+                 "(utilise --interval pour forcer une autre valeur).")
+
     mode_label = "DEMO (paper trading)" if args.demo else "LIVE -- ORDRES REELS"
-    market_mode = "soccer" if args.soccer else "macro"
+    market_mode = "soccer" if args.soccer else ("btc" if args.btc else "macro")
     sep = "=" * 62
 
     print("\n" + sep)
     print("   KALSHI MACRO ALPHA ENGINE V3")
     print(sep)
     log.info(f"Mode          : {mode_label}")
-    log.info(f"Type marche   : {'SOCCER (resultat de match)' if args.soccer else 'MACRO (economique)'}")
+    log.info(f"Type marche   : {'BTC 15min (modele math, 0 cout Claude)' if args.btc else ('SOCCER (resultat de match)' if args.soccer else 'MACRO (economique)')}")
     log.info(f"Capital       : ${args.capital:,.2f}")
     log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
     log.info(f"Max trades/cyc: {args.max_trades_cycle}")
-    log.info(f"Boucle        : {'OUI -- toutes les ' + str(args.interval // 60) + ' min' if args.loop else 'NON'}")
+    interval_label = f"{args.interval}s" if args.interval < 90 else f"{args.interval // 60} min"
+    log.info(f"Boucle        : {'OUI -- toutes les ' + interval_label if args.loop else 'NON'}")
     log.info(f"Kalshi        : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE -- donnees fictives'}")
     log.info(f"Claude        : {'CLE OK' if ANTHROPIC_API_KEY else 'MANQUANTE'}")
     print(sep + "\n")

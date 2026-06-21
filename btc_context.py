@@ -1,364 +1,312 @@
 """
-BTC CONTEXT MODULE — Kalshi Alpha Engine V3
-Recupere les donnees crypto temps reel pour l'analyse des marches BTC Kalshi.
+btc_context.py
+Module de contexte BTC pour le mode --btc de kalshi_alpha_bot.py.
 
-Sources gratuites :
-- CoinGecko API (prix, market cap, sentiment)
-- Binance API (orderbook, funding rate, klines)
-- Alternative.me (Fear & Greed Index)
+OBJECTIF :
+Fournir un prix BTC fiable et une estimation de probabilite "above strike"
+SANS appeler Claude -- calcul mathematique instantane, zero cout API,
+zero latence, adapte a l'echelle de temps des marches Kalshi 15min.
 
-USAGE:
-    from btc_context import get_btc_context, get_btc_ticker
-    context = get_btc_context(target_price=65145.57, minutes=15)
-    ticker  = get_btc_ticker()  # ex: KXBTC15M-14JUN-T65145
+PRINCIPE :
+Kalshi regle ses marches BTC 15min contre le CME CF Bitcoin Real-Time Index
+(BRTI), qui est une mediane ponderee par volume des prix sur plusieurs
+exchanges regules (Coinbase, Kraken, Gemini, Bitstamp, itBit/Paxos).
+L'acces direct a l'API BRTI necessite une licence payante CF Benchmarks.//
+Ce module replique l'approche en agregeant les memes exchanges sources
+publiquement accessibles, ce qui donne une approximation tres proche du
+BRTI reel sans cout de licence.
+
+La probabilite "above strike" a l'expiration est estimee via le modele
+de Black-Scholes pour option binaire (cash-or-nothing) : la probabilite
+qu'un mouvement brownien geometrique termine au-dessus d'un seuil donne,
+fonction de la distance au strike, du temps restant et de la volatilite.
+
+USAGE (depuis kalshi_alpha_bot.py) :
+    from btc_context import get_btc_price, get_btc_context, estimate_probability
+
+    price = get_btc_price()
+    ctx   = get_btc_context(target_price=65000, minutes=15)
 """
 
-import os, json, time, logging
-from datetime import datetime, timezone
+import time
+import math
+import logging
+import statistics
 from typing import Optional
+
 import requests
 
 log = logging.getLogger("BTCContext")
 
-# CF Benchmarks RTI (source officielle Kalshi)
-CF_BASE = "https://www.cfbenchmarks.com/data/indices"
+# ── Exchanges sources (memes constituants que BRTI) ──────────────────────────
+# Chaque fonction retourne (prix, volume_24h_usd) ou None si echec.
 
-def get_cf_rti_price() -> Optional[float]:
-    """
-    Recupere le prix CF Benchmarks RTI — source officielle Kalshi.
-    Calcule une approximation via moyenne ponderee multi-exchanges.
-    """
-    # CF Benchmarks RTI = moyenne ponderee de Coinbase, Kraken, Bitstamp, itBit, Gemini
-    exchanges = [
-        ("https://api.coinbase.com/v2/prices/BTC-USD/spot", lambda d: float(d["data"]["amount"])),
-        ("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", lambda d: float(d["result"]["XXBTZUSD"]["c"][0])),
-        ("https://www.bitstamp.net/api/v2/ticker/btcusd/", lambda d: float(d["last"])),
-    ]
-    prices = []
-    for url, parser in exchanges:
-        try:
-            r = requests.get(url, timeout=5)
-            r.raise_for_status()
-            prices.append(parser(r.json()))
-        except Exception as e:
-            log.debug(f"Exchange {url}: {e}")
-
-    if not prices:
-        return None
-    # Moyenne simple des exchanges disponibles (approximation RTI)
-    rti = sum(prices) / len(prices)
-    return round(rti, 2), prices
-
-def get_spread_analysis(target: float, rti: float, spot: float) -> dict:
-    """
-    Analyse l'ecart entre prix spot, RTI et target Kalshi.
-    Crucial pour determiner la probabilite reelle de resolution.
-    """
-    rti_vs_target  = rti - target
-    spot_vs_target = spot - target
-    rti_vs_spot    = rti - spot
-
-    return {
-        "rti_price":       rti,
-        "spot_price":      spot,
-        "target":          target,
-        "rti_vs_target":   round(rti_vs_target, 2),
-        "spot_vs_target":  round(spot_vs_target, 2),
-        "rti_vs_spot":     round(rti_vs_spot, 2),
-        "rti_above":       rti > target,
-        "spread_pct":      round(rti_vs_target / target * 100, 4),
-        "risk_zone":       abs(rti_vs_target) < 100,  # Moins de $100 du target = zone risquee
-    }
-
-
-BINANCE_BASE  = "https://api.binance.com/api/v3"
-BINFUT_BASE   = "https://fapi.binance.com/fapi/v1"
-COINGECKO     = "https://api.coingecko.com/api/v3"
-FEARGREED     = "https://api.alternative.me/fng/"
-
-_cache = {}
-CACHE_TTL = 30  # 30 secondes pour crypto (ultra-frais)
-
-def _get(url, params=None, ttl=CACHE_TTL):
-    key = url + str(params)
-    now = time.time()
-    if key in _cache:
-        data, ts = _cache[key]
-        if now - ts < ttl:
-            return data
+def _fetch_coinbase() -> Optional[tuple]:
     try:
-        r = requests.get(url, params=params, timeout=8)
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=3)
+        r.raise_for_status()
+        price = float(r.json()["data"]["amount"])
+        return price, 1.0  # Coinbase spot endpoint ne donne pas le volume ici
+    except Exception as e:
+        log.debug(f"Coinbase fetch echoue: {e}")
+        return None
+
+def _fetch_kraken() -> Optional[tuple]:
+    try:
+        r = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=3)
+        r.raise_for_status()
+        data = r.json()["result"]
+        pair_key = list(data.keys())[0]
+        ticker = data[pair_key]
+        price  = float(ticker["c"][0])   # dernier prix trade
+        volume = float(ticker["v"][1])   # volume 24h
+        return price, volume
+    except Exception as e:
+        log.debug(f"Kraken fetch echoue: {e}")
+        return None
+
+def _fetch_gemini() -> Optional[tuple]:
+    try:
+        r = requests.get("https://api.gemini.com/v2/ticker/btcusd", timeout=3)
         r.raise_for_status()
         data = r.json()
-        _cache[key] = (data, now)
-        return data
+        price  = float(data["close"])
+        volume = float(data.get("volume", {}).get("BTC", 1.0))
+        return price, volume
     except Exception as e:
-        log.warning(f"Erreur {url}: {e}")
+        log.debug(f"Gemini fetch echoue: {e}")
         return None
+
+def _fetch_bitstamp() -> Optional[tuple]:
+    try:
+        r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=3)
+        r.raise_for_status()
+        data = r.json()
+        price  = float(data["last"])
+        volume = float(data["volume"])
+        return price, volume
+    except Exception as e:
+        log.debug(f"Bitstamp fetch echoue: {e}")
+        return None
+
 
 def get_btc_price() -> Optional[float]:
-    """Prix BTC spot temps reel (Binance)."""
-    d = _get(f"{BINANCE_BASE}/ticker/price", {"symbol": "BTCUSDT"})
-    return float(d["price"]) if d else None
+    """
+    Recupere le prix BTC actuel en agregeant plusieurs exchanges via une
+    mediane ponderee par volume -- approximation du CME CF BRTI utilise
+    par Kalshi pour le reglement des marches BTC 15min.
 
-def get_btc_klines(interval: str = "1m", limit: int = 15) -> list:
+    Retourne None si aucun exchange n'a pu etre interroge (panne reseau totale).
     """
-    Bougies BTC recentes.
-    interval: 1m, 5m, 15m, 1h
-    Retourne liste de {open, high, low, close, volume}
-    """
-    d = _get(f"{BINANCE_BASE}/klines", {
-        "symbol": "BTCUSDT", "interval": interval, "limit": limit
-    })
-    if not d:
-        return []
-    return [{
-        "open":   float(k[1]),
-        "high":   float(k[2]),
-        "low":    float(k[3]),
-        "close":  float(k[4]),
-        "volume": float(k[5]),
-        "time":   datetime.fromtimestamp(k[0]/1000, tz=timezone.utc).strftime("%H:%M"),
-    } for k in d]
+    fetchers = [_fetch_coinbase, _fetch_kraken, _fetch_gemini, _fetch_bitstamp]
+    results = []
+    for fetch in fetchers:
+        r = fetch()
+        if r is not None:
+            results.append(r)
 
-def get_orderbook_imbalance() -> Optional[float]:
-    """
-    Desequilibre orderbook BTC (bid vs ask).
-    > 0 = pression acheteuse, < 0 = pression vendeuse
-    """
-    d = _get(f"{BINANCE_BASE}/depth", {"symbol": "BTCUSDT", "limit": 20})
-    if not d:
+    if not results:
+        log.warning("Aucun exchange BTC accessible -- prix indisponible.")
         return None
-    bid_vol = sum(float(b[1]) for b in d["bids"])
-    ask_vol = sum(float(a[1]) for a in d["asks"])
-    total = bid_vol + ask_vol
-    if total == 0:
-        return None
-    return round((bid_vol - ask_vol) / total * 100, 2)
 
-def get_funding_rate() -> Optional[float]:
-    """Funding rate BTC perps (sentiment institutionnel)."""
-    d = _get(f"{BINFUT_BASE}/fundingRate", {
-        "symbol": "BTCUSDT", "limit": 1
-    }, ttl=300)
-    if d and len(d) > 0:
-        return float(d[0]["fundingRate"]) * 100
-    return None
+    if len(results) == 1:
+        return results[0][0]
 
-def get_fear_greed() -> Optional[dict]:
-    """Fear & Greed Index (0=peur extreme, 100=avidite extreme)."""
-    d = _get(FEARGREED, {"limit": 1}, ttl=3600)
-    if d and d.get("data"):
-        item = d["data"][0]
+    # Mediane ponderee par volume (meme principe que BRTI)
+    prices  = [p for p, v in results]
+    weights = [v for p, v in results]
+    total_w = sum(weights) or 1.0
+    weighted_median = sum(p * (w / total_w) for p, w in results)
+
+    # Filtre les outliers : si un exchange devie de >1% de la mediane simple,
+    # on l'exclut (protection contre une donnee corrompue d'un seul exchange)
+    simple_median = statistics.median(prices)
+    filtered = [(p, v) for p, v in results if abs(p - simple_median) / simple_median < 0.01]
+    if filtered and len(filtered) < len(results):
+        prices  = [p for p, v in filtered]
+        weights = [v for p, v in filtered]
+        total_w = sum(weights) or 1.0
+        weighted_median = sum(p * (w / total_w) for p, w in filtered)
+
+    log.info(f"BTC price ({len(results)} exchanges): ${weighted_median:,.2f}")
+    return round(weighted_median, 2)
+
+
+# ── Volatilite recente (pour le modele de probabilite) ──────────────────────
+
+_price_history = []  # [(timestamp, price), ...] -- historique en memoire du process
+
+def _record_price(price: float):
+    now = time.time()
+    _price_history.append((now, price))
+    # Garde seulement les 60 dernieres minutes d'historique
+    cutoff = now - 3600
+    while _price_history and _price_history[0][0] < cutoff:
+        _price_history.pop(0)
+
+def _recent_volatility_pct(window_minutes: int = 60) -> float:
+    """
+    Estime la volatilite recente du BTC (ecart-type des rendements log)
+    sur la fenetre donnee, annualisee puis ramenee a une base horaire.
+    Si l'historique est insuffisant, retourne une volatilite par defaut
+    raisonnable basee sur la volatilite typique du BTC (~40-60% annualisee).
+    """
+    if len(_price_history) < 3:
+        # Pas assez de donnees -- fallback sur une volatilite typique BTC
+        # ~50% annualisee -> ramenee a une fenetre de 15 min
+        annual_vol = 0.50
+        minutes_per_year = 365 * 24 * 60
+        return annual_vol * math.sqrt(15 / minutes_per_year)
+
+    now = time.time()
+    cutoff = now - (window_minutes * 60)
+    recent = [(t, p) for t, p in _price_history if t >= cutoff]
+    if len(recent) < 3:
+        recent = _price_history[-5:]
+
+    returns = []
+    for i in range(1, len(recent)):
+        p0 = recent[i - 1][1]
+        p1 = recent[i][1]
+        if p0 > 0:
+            returns.append(math.log(p1 / p0))
+
+    if len(returns) < 2:
+        annual_vol = 0.50
+        minutes_per_year = 365 * 24 * 60
+        return annual_vol * math.sqrt(15 / minutes_per_year)
+
+    stdev = statistics.stdev(returns)
+    # Ramene a l'echelle de 15 minutes (en supposant des observations ~reguliere
+    # sur la fenetre observee)
+    n_obs = len(recent)
+    span_minutes = (recent[-1][0] - recent[0][0]) / 60 or 1
+    per_obs_minutes = span_minutes / max(n_obs - 1, 1)
+    scale_to_15min = math.sqrt(15 / per_obs_minutes) if per_obs_minutes > 0 else 1
+    return stdev * scale_to_15min
+
+
+# ── Modele de probabilite (Black-Scholes binaire / cash-or-nothing) ─────────
+
+def _norm_cdf(x: float) -> float:
+    """Fonction de repartition de la loi normale standard (approximation erf)."""
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def estimate_probability(current_price: float, strike_price: float,
+                          minutes_remaining: float, volatility_15min: float = None) -> float:
+    """
+    Estime la probabilite que le prix BTC cloture AU-DESSUS du strike
+    a l'expiration, via le modele cash-or-nothing binaire :
+
+        P(S_T > K) = N(d2)
+        d2 = [ln(S/K) - 0.5*sigma^2*t] / (sigma*sqrt(t))
+
+    ou S = prix actuel, K = strike, sigma = volatilite (echelle de la
+    fenetre), t = fraction de la fenetre totale restante (normalisee a 1
+    pour une fenetre de 15min).
+
+    Retourne une probabilite entre 0.0 et 1.0.
+    """
+    if volatility_15min is None:
+        volatility_15min = _recent_volatility_pct()
+
+    if current_price <= 0 or strike_price <= 0 or minutes_remaining <= 0:
+        return 0.5
+
+    # t = fraction du temps restant par rapport a la fenetre de reference (15min)
+    t = max(minutes_remaining / 15.0, 0.01)
+    sigma = max(volatility_15min, 0.0001)  # evite division par zero
+
+    try:
+        d2 = (math.log(current_price / strike_price) - 0.5 * sigma**2 * t) / (sigma * math.sqrt(t))
+        prob_above = _norm_cdf(d2)
+    except (ValueError, ZeroDivisionError):
+        prob_above = 0.5
+
+    return max(0.0, min(1.0, prob_above))
+
+
+# ── Interface principale utilisee par kalshi_alpha_bot.py ───────────────────
+
+def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
+    """
+    Construit un resume textuel du contexte BTC pour fournir a Claude en
+    supervision (PAS pour decision de trade temps reel -- voir
+    evaluate_btc_trade ci-dessous pour la decision sans Claude).
+    """
+    price = get_btc_price()
+    if price is None:
+        return "Donnees BTC indisponibles (tous les exchanges sources ont echoue)."
+
+    _record_price(price)
+    vol = _recent_volatility_pct()
+    prob = estimate_probability(price, target_price or price, minutes, vol)
+
+    return (
+        f"Prix BTC agrege (multi-exchanges): ${price:,.2f}\n"
+        f"Strike cible: ${target_price:,.2f}\n"
+        f"Volatilite recente (echelle {minutes}min): {vol:.2%}\n"
+        f"Probabilite modele (above strike): {prob:.1%}\n"
+        f"Note: estimation mathematique (Black-Scholes binaire), pas une "
+        f"prediction qualitative -- a utiliser comme aide a la supervision."
+    )
+
+
+def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
+                        minutes_remaining: float, min_edge: float = 0.04) -> dict:
+    """
+    Decision de trade BTC 15min SANS appel Claude -- calcul instantane.
+    A appeler directement dans la boucle de trading pour eviter toute
+    latence sur un marche qui bouge en quelques secondes.
+
+    Retourne un dict compatible avec le format 'phase10' utilise ailleurs
+    dans le bot, pour rester homogene avec le reste du pipeline.
+    """
+    price = get_btc_price()
+    if price is None:
         return {
-            "value":       int(item["value"]),
-            "label":       item["value_classification"],
-            "timestamp":   item["timestamp"],
+            "verdict": "AUCUN TRADE",
+            "raison_principale": "Prix BTC indisponible (echec reseau exchanges).",
+            "confiance": 0, "edge": 0.0,
         }
-    return None
 
-def get_btc_dominance() -> Optional[float]:
-    """Dominance BTC sur le marche crypto total."""
-    d = _get(f"{COINGECKO}/global", ttl=3600)
-    if d:
-        return round(d.get("data", {}).get("market_cap_percentage", {}).get("btc", 0), 1)
-    return None
+    _record_price(price)
+    vol = _recent_volatility_pct()
+    prob_yes = estimate_probability(price, strike_price, minutes_remaining, vol)
+    market_prob_yes = market_yes_price_cents / 100.0
 
-def calc_rsi(closes: list, period: int = 14) -> Optional[float]:
-    """Calcule le RSI sur les dernieres bougies."""
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i-1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
+    edge_yes = prob_yes - market_prob_yes
+    edge_no  = (1 - prob_yes) - (1 - market_prob_yes)
 
-def calc_vwap(klines: list) -> Optional[float]:
-    """Calcule le VWAP sur les bougies fournies."""
-    if not klines:
-        return None
-    num = sum(((k["high"] + k["low"] + k["close"]) / 3) * k["volume"] for k in klines)
-    den = sum(k["volume"] for k in klines)
-    return round(num / den, 2) if den > 0 else None
-
-def get_btc_context(target_price: float, minutes: int = 15) -> str:
-    """
-    Genere le contexte BTC complet pour l'analyse Claude.
-    
-    Args:
-        target_price: Prix seuil du marche Kalshi
-        minutes:      Duree du contrat (15, 60, etc.)
-    
-    Returns:
-        Contexte textuel formate
-    """
-    log.info(f"Recuperation contexte BTC (target=${target_price:,.2f}, {minutes}min)...")
-
-    # ── Donnees temps reel ────────────────────────────────────────────────────
-    btc_price  = get_btc_price()
-
-    # CF Benchmarks RTI (source officielle Kalshi)
-    rti_result = get_cf_rti_price()
-    rti_price  = rti_result[0] if rti_result else btc_price
-    exch_prices = rti_result[1] if rti_result else []
-    spread     = get_spread_analysis(target_price, rti_price or btc_price, btc_price or 0) if btc_price else None
-    klines_1m  = get_btc_klines("1m",  limit=30)
-    klines_5m  = get_btc_klines("5m",  limit=12)
-    ob_imbal   = get_orderbook_imbalance()
-    funding    = get_funding_rate()
-    fg         = get_fear_greed()
-    dominance  = get_btc_dominance()
-
-    if not btc_price:
-        return "Donnees BTC non disponibles — verifiez la connexion internet."
-
-    # ── Calculs techniques ────────────────────────────────────────────────────
-    closes_1m = [k["close"] for k in klines_1m]
-    closes_5m = [k["close"] for k in klines_5m]
-    rsi_1m    = calc_rsi(closes_1m, 14)
-    rsi_5m    = calc_rsi(closes_5m, 9)
-    vwap_15m  = calc_vwap(klines_1m[-15:]) if len(klines_1m) >= 15 else None
-
-    # Distance au target
-    dist_pct  = ((btc_price - target_price) / target_price) * 100
-    above     = btc_price > target_price
-    dist_abs  = abs(btc_price - target_price)
-
-    # Momentum 5 dernières minutes
-    momentum  = None
-    if len(klines_1m) >= 5:
-        momentum = klines_1m[-1]["close"] - klines_1m[-5]["close"]
-
-    # Volume moyen vs dernier volume
-    vol_avg   = None
-    vol_ratio = None
-    if len(klines_1m) >= 10:
-        vol_avg   = sum(k["volume"] for k in klines_1m[-10:]) / 10
-        last_vol  = klines_1m[-1]["volume"]
-        vol_ratio = round(last_vol / vol_avg, 2) if vol_avg > 0 else None
-
-    # High / Low des 15 dernières minutes
-    hi15 = max(k["high"]  for k in klines_1m[-15:]) if len(klines_1m) >= 15 else None
-    lo15 = min(k["low"]   for k in klines_1m[-15:]) if len(klines_1m) >= 15 else None
-
-    # ── Formate le contexte ───────────────────────────────────────────────────
-    now_str = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-
-    lines = [
-        f"=== CONTEXTE BTC TEMPS REEL — {now_str} ===",
-        f"Marche Kalshi : BTC {minutes}min | Target : ${target_price:,.2f}",
-        "",
-        "--- PRIX CF BENCHMARKS (SOURCE OFFICIELLE KALSHI) ---",
-        f"  CF Benchmarks RTI  : ${rti_price:,.2f}" if rti_price else "  CF Benchmarks RTI  : N/A (Binance utilise)",
-        f"  Prix Binance spot  : ${btc_price:,.2f}" if btc_price else "",
-        f"  Ecart RTI vs Spot  : {spread['rti_vs_spot']:+.2f}$" if spread else "",
-        f"  RTI vs Target      : {spread['rti_vs_target']:+.2f}$ ({'AU-DESSUS' if spread and spread['rti_above'] else 'EN-DESSOUS'})" if spread else "",
-        f"  ZONE RISQUE        : {'⚠️ OUI — moins de $100 du target' if spread and spread['risk_zone'] else 'NON — marge suffisante'}" if spread else "",
-        "",
-        "--- PRIX & POSITION ---",
-        f"  Prix BTC actuel    : ${btc_price:,.2f}",
-        f"  Target Kalshi      : ${target_price:,.2f}",
-        f"  Position vs target : {'AU-DESSUS' if above else 'EN-DESSOUS'} de {dist_pct:+.3f}% (${dist_abs:,.2f})",
-        f"  VWAP 15min         : ${vwap_15m:,.2f}" if vwap_15m else "  VWAP 15min         : N/A",
-        f"  High 15min         : ${hi15:,.2f}" if hi15 else "",
-        f"  Low  15min         : ${lo15:,.2f}" if lo15 else "",
-        "",
-        "--- MOMENTUM & TECHNIQUE ---",
-        f"  RSI 1min (14)      : {rsi_1m}" if rsi_1m else "  RSI 1min          : N/A",
-        f"  RSI 5min (9)       : {rsi_5m}"  if rsi_5m else "  RSI 5min          : N/A",
-        f"  Momentum 5min      : {momentum:+.2f}$" if momentum is not None else "  Momentum 5min     : N/A",
-        f"  Volume ratio       : {vol_ratio}x vs moyenne" if vol_ratio else "  Volume ratio      : N/A",
-        "",
-        "--- SENTIMENT & ORDERBOOK ---",
-        f"  Orderbook imbalance: {ob_imbal:+.1f}% ({'ACHETEURS' if (ob_imbal or 0) > 0 else 'VENDEURS'} dominants)" if ob_imbal is not None else "  Orderbook         : N/A",
-        f"  Funding rate       : {funding:+.4f}% ({'long squeeze risque' if (funding or 0) > 0.05 else 'neutre/short' if (funding or 0) < 0 else 'neutre'})" if funding is not None else "  Funding rate      : N/A",
-        f"  Fear & Greed       : {fg['value']}/100 — {fg['label']}" if fg else "  Fear & Greed      : N/A",
-        f"  Dominance BTC      : {dominance}%" if dominance else "  Dominance BTC     : N/A",
-        "",
-        "--- ANALYSE RAPIDE ---",
-    ]
-
-    # Signaux automatiques
-    signals = []
-
-    if above:
-        signals.append(f"BTC est AU-DESSUS du target de ${dist_abs:,.2f} — favorise UP")
+    if edge_yes >= min_edge and edge_yes >= edge_no:
+        verdict = "ACHETER YES"
+        edge    = edge_yes
+    elif edge_no >= min_edge:
+        verdict = "ACHETER NO"
+        edge    = edge_no
     else:
-        signals.append(f"BTC est EN-DESSOUS du target de ${dist_abs:,.2f} — favorise DOWN")
+        verdict = "AUCUN TRADE"
+        edge    = max(edge_yes, edge_no)
 
-    if rsi_1m:
-        if rsi_1m > 70:
-            signals.append(f"RSI 1min suracheté ({rsi_1m}) — risque de retournement baissier")
-        elif rsi_1m < 30:
-            signals.append(f"RSI 1min survendu ({rsi_1m}) — risque de rebond haussier")
-        else:
-            signals.append(f"RSI 1min neutre ({rsi_1m}) — pas de signal fort")
+    # Confiance basee sur la distance au strike par rapport a la volatilite
+    # (plus le prix est loin du strike relativement a la vol, plus on est confiant)
+    distance_sigma = abs(math.log(price / strike_price)) / max(vol, 0.0001)
+    confiance = min(10, max(1, int(distance_sigma * 3)))
 
-    if momentum is not None:
-        if momentum > 50:
-            signals.append(f"Momentum 5min positif ({momentum:+.0f}$) — tendance haussière")
-        elif momentum < -50:
-            signals.append(f"Momentum 5min negatif ({momentum:+.0f}$) — tendance baissière")
-
-    if ob_imbal is not None:
-        if ob_imbal > 20:
-            signals.append(f"Forte pression acheteuse orderbook ({ob_imbal:+.1f}%)")
-        elif ob_imbal < -20:
-            signals.append(f"Forte pression vendeuse orderbook ({ob_imbal:+.1f}%)")
-
-    if vwap_15m and btc_price:
-        if btc_price > vwap_15m:
-            signals.append(f"Prix au-dessus du VWAP 15min (${vwap_15m:,.2f}) — momentum haussier")
-        else:
-            signals.append(f"Prix sous le VWAP 15min (${vwap_15m:,.2f}) — pression baissière")
-
-    # Signal de convergence
-    bull_signals = sum(1 for s in signals if "haussier" in s.lower() or "haussière" in s.lower() or "UP" in s or "DESSUS" in s)
-    bear_signals = sum(1 for s in signals if "baissier" in s.lower() or "baissière" in s.lower() or "DOWN" in s or "DESSOUS" in s)
-
-    for s in signals:
-        lines.append(f"  → {s}")
-
-    lines.append("")
-    lines.append(f"  CONVERGENCE : {bull_signals} signaux UP vs {bear_signals} signaux DOWN")
-    lines.append(f"  VERDICT TECHNIQUE : {'PLUTOT UP' if bull_signals > bear_signals else 'PLUTOT DOWN' if bear_signals > bull_signals else 'NEUTRE'}")
-
-    # Avertissement critique CF Benchmarks
-    if spread and spread["risk_zone"]:
-        lines.append("")
-        lines.append("  ⚠️  ATTENTION : Prix RTI a moins de $100 du target")
-        lines.append(f"  La resolution Kalshi utilise la MOYENNE des 60 dernieres")
-        lines.append(f"  cotations CF Benchmarks — pas le prix spot Binance.")
-        lines.append(f"  Ecart actuel RTI vs target : {spread['rti_vs_target']:+.2f}$")
-        lines.append(f"  Une volatilite de {abs(spread['rti_vs_target']):.0f}$ suffit a inverser la resolution.")
-
-    return "\n".join(l for l in lines if l is not None)
-
-
-def get_btc_ticker(target_price: float, minutes: int = 15) -> str:
-    """
-    Genere le ticker Kalshi probable pour ce marche BTC.
-    Format: KXBTC15M-DDMMM-TXXXXX
-    """
-    now = datetime.now()
-    date_str = now.strftime("%d%b").upper()
-    price_str = str(int(target_price))
-    return f"KXBTC{minutes}M-{date_str}-T{price_str}"
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
-    print("\n=== TEST BTC CONTEXT MODULE ===\n")
-    btc = get_btc_price()
-    print(f"Prix BTC actuel : ${btc:,.2f}" if btc else "Prix non disponible")
-    print()
-    ctx = get_btc_context(target_price=65145.57, minutes=15)
-    print(ctx)
+    return {
+        "verdict":           verdict,
+        "prob_reelle":       prob_yes if verdict != "ACHETER NO" else 1 - prob_yes,
+        "prob_marche":       market_prob_yes if verdict != "ACHETER NO" else 1 - market_prob_yes,
+        "edge":              edge,
+        "confiance":         confiance,
+        "risque":            10 - confiance,
+        "grade":             "A" if edge > 0.10 else "B" if edge > 0.06 else "C" if edge > 0.04 else "D",
+        "raison_principale": (
+            f"Modele math (BS binaire): prix=${price:,.2f} strike=${strike_price:,.2f} "
+            f"vol={vol:.2%} t={minutes_remaining:.1f}min -> P(yes)={prob_yes:.1%}"
+        ),
+        "risque_principal":  "Volatilite BTC peut deviée brutalement (news, liquidation cascade).",
+        "risque_exogene":    "Slippage d'execution si le carnet d'ordres est fin.",
+        "taille_position":   "1%" if edge > 0.10 else "0.5%",
+    }
