@@ -186,6 +186,41 @@ def _recent_volatility_pct(window_minutes: int = 60) -> float:
     return stdev * scale_to_15min
 
 
+def _recent_momentum(window_minutes: float = 5.0) -> float:
+    """
+    Calcule la derive (drift) recente du prix BTC, en log-return par minute,
+    sur une fenetre courte (5min par defaut). Une valeur negative signifie
+    une tendance baissiere recente, positive une tendance haussiere.
+
+    BUG CORRIGE (suite a 4 trades YES perdus consecutifs alors que le marche
+    etait en tendance baissiere sur plusieurs fenetres successives) :
+    le modele Black-Scholes pur suppose un mouvement aleatoire centre sur le
+    prix actuel (martingale), sans memoire de la direction recente. Sur des
+    fenetres tres courtes (15min), le BTC montre une autocorrelation/momentum
+    a court terme mesurable -- ignorer ce signal biaise systematiquement le
+    modele du mauvais cote quand une tendance est en cours.
+    """
+    if len(_price_history) < 3:
+        return 0.0
+
+    now = time.time()
+    cutoff = now - (window_minutes * 60)
+    recent = [(t, p) for t, p in _price_history if t >= cutoff]
+    if len(recent) < 3:
+        recent = _price_history[-5:]
+    if len(recent) < 2:
+        return 0.0
+
+    t0, p0 = recent[0]
+    t1, p1 = recent[-1]
+    span_minutes = (t1 - t0) / 60
+    if span_minutes <= 0 or p0 <= 0:
+        return 0.0
+
+    log_return = math.log(p1 / p0)
+    return log_return / span_minutes  # drift par minute
+
+
 # ── Modele de probabilite (Black-Scholes binaire / cash-or-nothing) ─────────
 
 def _norm_cdf(x: float) -> float:
@@ -194,17 +229,25 @@ def _norm_cdf(x: float) -> float:
 
 
 def estimate_probability(current_price: float, strike_price: float,
-                          minutes_remaining: float, volatility_15min: float = None) -> float:
+                          minutes_remaining: float, volatility_15min: float = None,
+                          drift_weight: float = 0.35) -> float:
     """
     Estime la probabilite que le prix BTC cloture AU-DESSUS du strike
-    a l'expiration, via le modele cash-or-nothing binaire :
+    a l'expiration, via le modele cash-or-nothing binaire AVEC un terme
+    de derive (drift) base sur le momentum recent :
 
         P(S_T > K) = N(d2)
-        d2 = [ln(S/K) - 0.5*sigma^2*t] / (sigma*sqrt(t))
+        d2 = [ln(S/K) + mu*t - 0.5*sigma^2*t] / (sigma*sqrt(t))
 
     ou S = prix actuel, K = strike, sigma = volatilite (echelle de la
-    fenetre), t = fraction de la fenetre totale restante (normalisee a 1
-    pour une fenetre de 15min).
+    fenetre), t = fraction de la fenetre totale restante, mu = derive
+    recente ponderee (drift_weight controle la confiance accordee au
+    momentum court terme -- 0 = modele neutre pur, 1 = extrapolation
+    complete de la tendance recente).
+
+    drift_weight=0.35 est un compromis : on accorde un poids reel au
+    momentum recent (qui s'est avere predictif sur les cas observes) sans
+    sur-extrapoler une tendance qui peut se retourner a tout moment.
 
     Retourne une probabilite entre 0.0 et 1.0.
     """
@@ -218,8 +261,14 @@ def estimate_probability(current_price: float, strike_price: float,
     t = max(minutes_remaining / 15.0, 0.01)
     sigma = max(volatility_15min, 0.0001)  # evite division par zero
 
+    # Terme de derive : momentum recent (log-return/minute) extrapole sur le
+    # temps restant, pondere par drift_weight pour eviter la sur-confiance.
+    momentum_per_min = _recent_momentum()
+    mu = momentum_per_min * drift_weight
+
     try:
-        d2 = (math.log(current_price / strike_price) - 0.5 * sigma**2 * t) / (sigma * math.sqrt(t))
+        d2 = (math.log(current_price / strike_price) + mu * minutes_remaining
+              - 0.5 * sigma**2 * t) / (sigma * math.sqrt(t))
         prob_above = _norm_cdf(d2)
     except (ValueError, ZeroDivisionError):
         prob_above = 0.5
@@ -254,11 +303,18 @@ def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
 
 
 def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
-                        minutes_remaining: float, min_edge: float = 0.04) -> dict:
+                        minutes_remaining: float, min_edge: float = 0.04,
+                        min_history_points: int = 5) -> dict:
     """
     Decision de trade BTC 15min SANS appel Claude -- calcul instantane.
     A appeler directement dans la boucle de trading pour eviter toute
     latence sur un marche qui bouge en quelques secondes.
+
+    SECURITE : si l'historique de prix en memoire est trop court (ex: bot
+    qui vient de redemarrer), la volatilite et le drift utilisent des
+    valeurs de fallback peu fiables -- on refuse de trader tant qu'on n'a
+    pas accumule au moins `min_history_points` observations, pour eviter
+    de trader sur un modele essentiellement aveugle juste apres un restart.
 
     Retourne un dict compatible avec le format 'phase10' utilise ailleurs
     dans le bot, pour rester homogene avec le reste du pipeline.
@@ -272,6 +328,18 @@ def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
         }
 
     _record_price(price)
+
+    if len(_price_history) < min_history_points:
+        return {
+            "verdict": "AUCUN TRADE",
+            "raison_principale": (
+                f"Historique insuffisant ({len(_price_history)}/{min_history_points} "
+                f"points) -- volatilite/momentum pas encore fiables (bot recemment demarre)."
+            ),
+            "confiance": 0, "edge": 0.0,
+            "prob_reelle": 0.5, "prob_marche": market_yes_price_cents / 100.0,
+        }
+
     vol = _recent_volatility_pct()
     prob_yes = estimate_probability(price, strike_price, minutes_remaining, vol)
     market_prob_yes = market_yes_price_cents / 100.0
