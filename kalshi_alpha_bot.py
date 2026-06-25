@@ -65,13 +65,6 @@ except ImportError:
 # ── Import BTC context (optionnel) ───────────────────────────────────────────
 try:
     from btc_context import get_btc_context, get_btc_price, record_trade_result, get_performance_stats
-try:
-    from trade_resolver import resolve_pending_trades, print_stats as print_trade_stats
-    RESOLVER_AVAILABLE = True
-except ImportError:
-    RESOLVER_AVAILABLE = False
-    def resolve_pending_trades(k, **kw): return 0
-    def print_trade_stats(): pass
     BTC_AVAILABLE = True
 except ImportError:
     BTC_AVAILABLE = False
@@ -79,6 +72,17 @@ except ImportError:
         return ""
     def get_btc_price():
         return 65000.0
+    def record_trade_result(**kw): pass
+    def get_performance_stats(): return {}
+
+# ── Import Trade Resolver (optionnel) ────────────────────────────────────────
+try:
+    from trade_resolver import resolve_pending_trades, print_stats as print_trade_stats
+    RESOLVER_AVAILABLE = True
+except ImportError:
+    RESOLVER_AVAILABLE = False
+    def resolve_pending_trades(k, **kw): return 0
+    def print_trade_stats(): pass
 
 
 load_dotenv()
