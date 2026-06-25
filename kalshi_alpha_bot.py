@@ -64,7 +64,14 @@ except ImportError:
 
 # ── Import BTC context (optionnel) ───────────────────────────────────────────
 try:
-    from btc_context import get_btc_context, get_btc_price
+    from btc_context import get_btc_context, get_btc_price, record_trade_result, get_performance_stats
+try:
+    from trade_resolver import resolve_pending_trades, print_stats as print_trade_stats
+    RESOLVER_AVAILABLE = True
+except ImportError:
+    RESOLVER_AVAILABLE = False
+    def resolve_pending_trades(k, **kw): return 0
+    def print_trade_stats(): pass
     BTC_AVAILABLE = True
 except ImportError:
     BTC_AVAILABLE = False
@@ -581,6 +588,13 @@ class TradeManager:
         if not self.demo and "error" not in result:
             self.risk.record_trade((price / 100) * count)
 
+        # Enregistre le trade pour la calibration BTC
+        if self.mode == "btc" and BTC_AVAILABLE:
+            try:
+                record_trade_result(verdict=verdict, edge=edge, won=False, pnl=0.0)
+            except Exception:
+                pass
+
         trade_log = {
             "timestamp":       datetime.now().isoformat(),
             "mode":            "DEMO" if self.demo else "LIVE",
@@ -729,6 +743,15 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
     if getattr(args, "btc", False) and BTC_AVAILABLE:
         from btc_context import evaluate_btc_trade
         from datetime import datetime as _dt, timezone as _tz
+
+        # Resolution des trades passes (apprentissage) -- tous les 5 cycles
+        if RESOLVER_AVAILABLE and cycle % 5 == 1:
+            try:
+                n_resolved = resolve_pending_trades(kalshi)
+                if n_resolved > 0:
+                    log.info(f"[Resolver] {n_resolved} trades resolus ce cycle -> modele mis a jour.")
+            except Exception as _e:
+                log.debug(f"[Resolver] Erreur: {_e}")
 
         manual_ticker = getattr(args, "btc_ticker", "")
 
@@ -960,6 +983,21 @@ def main():
     log.info(f"Boucle        : {'OUI -- toutes les ' + interval_label if args.loop else 'NON'}")
     log.info(f"Kalshi        : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE -- donnees fictives'}")
     log.info(f"Claude        : {'CLE OK' if ANTHROPIC_API_KEY else 'MANQUANTE'}")
+
+    # Affiche les stats de performance BTC au demarrage
+    if args.btc and BTC_AVAILABLE:
+        try:
+            stats = get_performance_stats()
+            if stats["total"] > 0:
+                log.info(f"[PERF BTC] Trades passes : {stats['total']} | "
+                         f"Win rate : {stats['win_rate']:.1%} | "
+                         f"PnL total : ${stats['total_pnl']:.2f} | "
+                         f"drift_weight calibre : {stats['drift_weight']:.2f}")
+            else:
+                log.info("[PERF BTC] Aucun trade precedent enregistre -- demarrage a zero.")
+        except Exception:
+            pass
+
     print(sep + "\n")
 
     if not ANTHROPIC_API_KEY:
