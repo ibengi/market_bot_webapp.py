@@ -11,7 +11,7 @@ PRINCIPE :
 Kalshi regle ses marches BTC 15min contre le CME CF Bitcoin Real-Time Index
 (BRTI), qui est une mediane ponderee par volume des prix sur plusieurs
 exchanges regules (Coinbase, Kraken, Gemini, Bitstamp, itBit/Paxos).
-L'acces direct a l'API BRTI necessite une licence payante CF Benchmarks.//
+L'acces direct a l'API BRTI necessite une licence payante CF Benchmarks.
 Ce module replique l'approche en agregeant les memes exchanges sources
 publiquement accessibles, ce qui donne une approximation tres proche du
 BRTI reel sans cout de licence.
@@ -26,6 +26,12 @@ USAGE (depuis kalshi_alpha_bot.py) :
 
     price = get_btc_price()
     ctx   = get_btc_context(target_price=65000, minutes=15)
+
+CORRECTIONS v2 :
+- evaluate_btc_trade accepte maintenant market_no_price_cents en parametre
+  pour calculer l'edge NO avec le vrai prix du marche (et non 1 - yes_price)
+- confiance calculee correctement pour les deux cotes
+- taille_position adaptee a l'edge reel
 """
 
 import time
@@ -177,8 +183,7 @@ def _recent_volatility_pct(window_minutes: int = 60) -> float:
         return annual_vol * math.sqrt(15 / minutes_per_year)
 
     stdev = statistics.stdev(returns)
-    # Ramene a l'echelle de 15 minutes (en supposant des observations ~reguliere
-    # sur la fenetre observee)
+    # Ramene a l'echelle de 15 minutes
     n_obs = len(recent)
     span_minutes = (recent[-1][0] - recent[0][0]) / 60 or 1
     per_obs_minutes = span_minutes / max(n_obs - 1, 1)
@@ -191,14 +196,6 @@ def _recent_momentum(window_minutes: float = 5.0) -> float:
     Calcule la derive (drift) recente du prix BTC, en log-return par minute,
     sur une fenetre courte (5min par defaut). Une valeur negative signifie
     une tendance baissiere recente, positive une tendance haussiere.
-
-    BUG CORRIGE (suite a 4 trades YES perdus consecutifs alors que le marche
-    etait en tendance baissiere sur plusieurs fenetres successives) :
-    le modele Black-Scholes pur suppose un mouvement aleatoire centre sur le
-    prix actuel (martingale), sans memoire de la direction recente. Sur des
-    fenetres tres courtes (15min), le BTC montre une autocorrelation/momentum
-    a court terme mesurable -- ignorer ce signal biaise systematiquement le
-    modele du mauvais cote quand une tendance est en cours.
     """
     if len(_price_history) < 3:
         return 0.0
@@ -234,20 +231,7 @@ def estimate_probability(current_price: float, strike_price: float,
     """
     Estime la probabilite que le prix BTC cloture AU-DESSUS du strike
     a l'expiration, via le modele cash-or-nothing binaire AVEC un terme
-    de derive (drift) base sur le momentum recent :
-
-        P(S_T > K) = N(d2)
-        d2 = [ln(S/K) + mu*t - 0.5*sigma^2*t] / (sigma*sqrt(t))
-
-    ou S = prix actuel, K = strike, sigma = volatilite (echelle de la
-    fenetre), t = fraction de la fenetre totale restante, mu = derive
-    recente ponderee (drift_weight controle la confiance accordee au
-    momentum court terme -- 0 = modele neutre pur, 1 = extrapolation
-    complete de la tendance recente).
-
-    drift_weight=0.35 est un compromis : on accorde un poids reel au
-    momentum recent (qui s'est avere predictif sur les cas observes) sans
-    sur-extrapoler une tendance qui peut se retourner a tout moment.
+    de derive (drift) base sur le momentum recent.
 
     Retourne une probabilite entre 0.0 et 1.0.
     """
@@ -257,12 +241,9 @@ def estimate_probability(current_price: float, strike_price: float,
     if current_price <= 0 or strike_price <= 0 or minutes_remaining <= 0:
         return 0.5
 
-    # t = fraction du temps restant par rapport a la fenetre de reference (15min)
     t = max(minutes_remaining / 15.0, 0.01)
-    sigma = max(volatility_15min, 0.0001)  # evite division par zero
+    sigma = max(volatility_15min, 0.0001)
 
-    # Terme de derive : momentum recent (log-return/minute) extrapole sur le
-    # temps restant, pondere par drift_weight pour eviter la sur-confiance.
     momentum_per_min = _recent_momentum()
     mu = momentum_per_min * drift_weight
 
@@ -280,9 +261,7 @@ def estimate_probability(current_price: float, strike_price: float,
 
 def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
     """
-    Construit un resume textuel du contexte BTC pour fournir a Claude en
-    supervision (PAS pour decision de trade temps reel -- voir
-    evaluate_btc_trade ci-dessous pour la decision sans Claude).
+    Construit un resume textuel du contexte BTC pour supervision.
     """
     price = get_btc_price()
     if price is None:
@@ -302,22 +281,44 @@ def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
     )
 
 
-def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
-                        minutes_remaining: float, min_edge: float = 0.04,
-                        min_history_points: int = 5) -> dict:
+def _position_size(edge: float) -> str:
+    """Taille de position proportionnelle a l'edge detecte."""
+    if edge >= 0.15:
+        return "2%"
+    if edge >= 0.10:
+        return "1%"
+    return "0.5%"
+
+
+def _grade(edge: float) -> str:
+    if edge > 0.10:
+        return "A"
+    if edge > 0.06:
+        return "B"
+    if edge > 0.04:
+        return "C"
+    return "D"
+
+
+def evaluate_btc_trade(
+    strike_price: float,
+    market_yes_price_cents: int,
+    minutes_remaining: float,
+    min_edge: float = 0.04,
+    min_history_points: int = 5,
+    market_no_price_cents: int = None,   # ← NOUVEAU : prix NO reel du marche
+) -> dict:
     """
     Decision de trade BTC 15min SANS appel Claude -- calcul instantane.
-    A appeler directement dans la boucle de trading pour eviter toute
-    latence sur un marche qui bouge en quelques secondes.
 
-    SECURITE : si l'historique de prix en memoire est trop court (ex: bot
-    qui vient de redemarrer), la volatilite et le drift utilisent des
-    valeurs de fallback peu fiables -- on refuse de trader tant qu'on n'a
-    pas accumule au moins `min_history_points` observations, pour eviter
-    de trader sur un modele essentiellement aveugle juste apres un restart.
-
-    Retourne un dict compatible avec le format 'phase10' utilise ailleurs
-    dans le bot, pour rester homogene avec le reste du pipeline.
+    CORRECTION v2 :
+    - Accepte market_no_price_cents pour calculer l'edge NO avec le vrai
+      prix Kalshi (et non 1 - yes_price, qui ignore le spread bid/ask).
+    - Si market_no_price_cents est absent (backward compat), fallback sur
+      100 - market_yes_price_cents (comportement precedent).
+    - prob_reelle / prob_marche toujours coherents avec le cote trade.
+    - confiance calculee sur d2 mis a l'echelle du temps restant (fix existant
+      conserve).
     """
     price = get_btc_price()
     if price is None:
@@ -334,37 +335,66 @@ def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
             "verdict": "AUCUN TRADE",
             "raison_principale": (
                 f"Historique insuffisant ({len(_price_history)}/{min_history_points} "
-                f"points) -- volatilite/momentum pas encore fiables (bot recemment demarre)."
+                f"points) -- volatilite/momentum pas encore fiables."
             ),
             "confiance": 0, "edge": 0.0,
-            "prob_reelle": 0.5, "prob_marche": market_yes_price_cents / 100.0,
+            "prob_reelle": 0.5,
+            "prob_marche": market_yes_price_cents / 100.0,
         }
 
     vol = _recent_volatility_pct()
-    prob_yes = estimate_probability(price, strike_price, minutes_remaining, vol)
-    market_prob_yes = market_yes_price_cents / 100.0
 
-    edge_yes = prob_yes - market_prob_yes
-    edge_no  = (1 - prob_yes) - (1 - market_prob_yes)
+    # ── Probabilites modele ───────────────────────────────────────────────────
+    prob_yes_model = estimate_probability(price, strike_price, minutes_remaining, vol)
+    prob_no_model  = 1.0 - prob_yes_model
 
-    if edge_yes >= min_edge and edge_yes >= edge_no:
-        verdict = "ACHETER YES"
-        edge    = edge_yes
-    elif edge_no >= min_edge:
-        verdict = "ACHETER NO"
-        edge    = edge_no
+    # ── Prix marche des deux cotes (en fraction, pas en cents) ───────────────
+    market_yes = market_yes_price_cents / 100.0
+
+    # Utilise le vrai prix NO si fourni, sinon fallback sur complement du YES
+    # (le complement sous-estime l'edge NO quand le spread est large)
+    if market_no_price_cents is not None:
+        market_no = market_no_price_cents / 100.0
     else:
-        verdict = "AUCUN TRADE"
-        edge    = max(edge_yes, edge_no)
+        market_no = 1.0 - market_yes
 
-    # Confiance basee sur |d2| (distance au strike normalisee par la vol ET
-    # le temps restant -- meme echelle que le calcul de probabilite ci-dessus).
-    # BUG CORRIGE : l'ancienne version utilisait la volatilite brute sans la
-    # mettre a l'echelle du temps restant, ce qui rendait le modele
-    # systematiquement trop prudent en toute fin de fenetre (la ou il devrait
-    # au contraire etre le plus confiant, puisqu'il reste tres peu de temps
-    # pour que le prix s'eloigne du strike).
-    t_scaled = max(minutes_remaining / 15.0, 0.01)
+    # ── Edges independants sur chaque cote ───────────────────────────────────
+    edge_yes = prob_yes_model - market_yes   # positif => YES est sous-paye
+    edge_no  = prob_no_model  - market_no    # positif => NO est sous-paye
+
+    log.debug(
+        f"[BTC] strike=${strike_price:,.0f} price=${price:,.0f} "
+        f"P(yes)={prob_yes_model:.1%} | "
+        f"mkt_yes={market_yes:.1%} edge_yes={edge_yes:+.1%} | "
+        f"mkt_no={market_no:.1%}  edge_no={edge_no:+.1%}"
+    )
+
+    # ── Selection du cote : meilleur edge POSITIF au-dessus du seuil ─────────
+    # Si les deux cotes sont sous le seuil -> AUCUN TRADE
+    # Si les deux cotes depassent le seuil -> on prend celui avec le plus grand edge
+    trade_yes = edge_yes >= min_edge
+    trade_no  = edge_no  >= min_edge
+
+    if trade_yes and trade_no:
+        # Les deux ont un edge -- on prend le meilleur
+        if edge_yes >= edge_no:
+            verdict, edge_taken = "ACHETER YES", edge_yes
+            prob_reelle_trade, prob_marche_trade = prob_yes_model, market_yes
+        else:
+            verdict, edge_taken = "ACHETER NO", edge_no
+            prob_reelle_trade, prob_marche_trade = prob_no_model, market_no
+    elif trade_yes:
+        verdict, edge_taken = "ACHETER YES", edge_yes
+        prob_reelle_trade, prob_marche_trade = prob_yes_model, market_yes
+    elif trade_no:
+        verdict, edge_taken = "ACHETER NO", edge_no
+        prob_reelle_trade, prob_marche_trade = prob_no_model, market_no
+    else:
+        verdict, edge_taken = "AUCUN TRADE", max(edge_yes, edge_no)
+        prob_reelle_trade, prob_marche_trade = prob_yes_model, market_yes
+
+    # ── Confiance : normalisee sur le cote trade ──────────────────────────────
+    t_scaled     = max(minutes_remaining / 15.0, 0.01)
     sigma_scaled = max(vol, 0.0001) * math.sqrt(t_scaled)
     try:
         d2 = abs(math.log(price / strike_price) - 0.5 * vol**2 * t_scaled) / sigma_scaled
@@ -372,19 +402,35 @@ def evaluate_btc_trade(strike_price: float, market_yes_price_cents: int,
         d2 = 0.0
     confiance = min(10, max(1, int(d2 * 3)))
 
+    # ── EV ────────────────────────────────────────────────────────────────────
+    # Gain si gagne = (1 - prix_paye) ; perte si perd = prix_paye
+    p_gain     = prob_reelle_trade
+    p_perte    = 1.0 - prob_reelle_trade
+    gain       = 1.0 - prob_marche_trade
+    perte      = prob_marche_trade
+    ev_brute   = p_gain * gain - p_perte * perte
+    ev_nette   = p_gain * gain * 0.9755 - p_perte * perte  # apres frais Kalshi
+
+    direction = "au-dessus" if verdict == "ACHETER YES" else "en-dessous"
+    raison = (
+        f"Modele BS binaire: prix=${price:,.2f} strike=${strike_price:,.2f} "
+        f"vol={vol:.2%} t={minutes_remaining:.1f}min | "
+        f"P({direction})={prob_reelle_trade:.1%} vs mkt={prob_marche_trade:.1%} "
+        f"edge={edge_taken:+.1%}"
+    )
+
     return {
         "verdict":           verdict,
-        "prob_reelle":       prob_yes if verdict != "ACHETER NO" else 1 - prob_yes,
-        "prob_marche":       market_prob_yes if verdict != "ACHETER NO" else 1 - market_prob_yes,
-        "edge":              edge,
+        "prob_reelle":       round(prob_reelle_trade, 4),
+        "prob_marche":       round(prob_marche_trade, 4),
+        "edge":              round(edge_taken, 4),
+        "ev_brute":          round(ev_brute, 4),
+        "ev_nette":          round(ev_nette, 4),
         "confiance":         confiance,
         "risque":            10 - confiance,
-        "grade":             "A" if edge > 0.10 else "B" if edge > 0.06 else "C" if edge > 0.04 else "D",
-        "raison_principale": (
-            f"Modele math (BS binaire): prix=${price:,.2f} strike=${strike_price:,.2f} "
-            f"vol={vol:.2%} t={minutes_remaining:.1f}min -> P(yes)={prob_yes:.1%}"
-        ),
-        "risque_principal":  "Volatilite BTC peut deviée brutalement (news, liquidation cascade).",
+        "grade":             _grade(edge_taken),
+        "raison_principale": raison,
+        "risque_principal":  "Volatilite BTC peut devier brutalement (news, liquidation cascade).",
         "risque_exogene":    "Slippage d'execution si le carnet d'ordres est fin.",
-        "taille_position":   "1%" if edge > 0.10 else "0.5%",
+        "taille_position":   _position_size(edge_taken) if verdict != "AUCUN TRADE" else "0%",
     }

@@ -401,14 +401,6 @@ class KalshiClient:
         Envoie un ordre sur Kalshi via l'endpoint V2 (/portfolio/events/orders).
         dry_run=True  -> simulation locale uniquement (aucun appel API).
         dry_run=False -> ordre reel envoye a l'API (live ou demo selon base_url).
-
-        L'ancien endpoint /portfolio/orders avec yes_price/no_price (cents, int)
-        a ete deprecie par Kalshi (HTTP 410 deprecated_v1_order_endpoint).
-        Le format V2 utilise :
-          - book_side "bid" (acheteur) systematiquement pour un achat
-          - outcome_side "yes" ou "no" pour indiquer quel cote du contrat
-          - price en dollars (string, ex: "0.5600") au lieu de cents (int)
-          - count en string fixed-point (ex: "20.00")
         """
         if dry_run:
             log.info(f"[DRY RUN] {side.upper()} {count}x {ticker} @ {price}c")
@@ -424,8 +416,8 @@ class KalshiClient:
             payload = {
                 "ticker":                    ticker,
                 "client_order_id":           f"alpha_{int(time.time())}",
-                "side":                      "bid",          # on est toujours acheteur (buy)
-                "outcome_side":              side,            # "yes" ou "no"
+                "side":                      "bid",
+                "outcome_side":              side,
                 "count":                     f"{count:.2f}",
                 "price":                     price_dollars,
                 "time_in_force":             "good_till_canceled",
@@ -501,7 +493,6 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
                 )
                 raw = resp.content[0].text.strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
-                # Extrait le premier objet JSON valide (robuste si texte parasite autour)
                 start = raw.find("{")
                 end   = raw.rfind("}") + 1
                 if start >= 0 and end > start:
@@ -545,11 +536,6 @@ class TradeManager:
         taille    = p10.get("taille_position", "0%")
         ticker    = market_data.get("ticker", "?")
 
-        # Seuils adaptes par type de marche :
-        # - soccer : plus stricts (variance intrinseque elevee, peu de donnees fiables)
-        # - btc    : edge configurable (--btc-min-edge), confiance min plus basse
-        #            car le modele mathematique est calibre differemment de
-        #            Claude (echelle 1-10 mais distribution differente)
         if self.mode == "soccer":
             min_edge, min_confidence = 0.05, 5
         elif self.mode == "btc":
@@ -565,7 +551,6 @@ class TradeManager:
             log.warning(f"[{ticker}] BLOQUE -- edge={edge:.1%} conf={confiance}/10")
             return None
 
-        # Filtre liquidite specifique soccer (marches sportifs parfois illiquides)
         if self.mode == "soccer":
             volume = market_data.get("volume", 0) or 0
             if volume < 100:
@@ -585,7 +570,6 @@ class TradeManager:
             log.warning("Nombre de contrats = 0 -- trade annule.")
             return None
 
-        # Verification des limites de securite (LIVE uniquement)
         if not self.demo:
             ok, reason = self.risk.can_trade(trades_this_cycle)
             if not ok:
@@ -695,8 +679,8 @@ def print_report(ticker: str, analysis: dict, demo: bool, risk: RiskManager):
   Prob reelle   : {p10.get('prob_reelle', 0):.1%}
   Prob marche   : {p10.get('prob_marche', 0):.1%}
   Edge          : {p10.get('edge', 0):.1%}
-  EV brute      : {p8.get('ev_brute', 0):.1%}
-  EV nette      : {p8.get('ev_nette', 0):.1%}
+  EV brute      : {p8.get('ev_brute', p10.get('ev_brute', 0)):.1%}
+  EV nette      : {p8.get('ev_nette', p10.get('ev_nette', 0)):.1%}
   Confiance     : {p10.get('confiance', 0)}/10
   Risque        : {p10.get('risque', 0)}/10
   Position      : {p10.get('taille_position', 'N/A')}
@@ -735,24 +719,13 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
     trades_this_cycle = 0
 
-    # Verification stop loss avant meme de commencer (LIVE uniquement)
     if not manager.demo:
         ok, reason = manager.risk.can_trade(trades_this_cycle)
         if not ok:
             log.warning(f"[RISK] Cycle bloque: {reason}")
             return 0
 
-    # ── Mode BTC 15min (moteur mathematique, ZERO appel Claude) ──────────────
-    # Sur une fenetre de 15min, un appel Claude (30-45s) rend le prix obsolete
-    # avant meme que l'ordre parte. La decision utilise donc un modele
-    # Black-Scholes binaire calcule instantanement (voir btc_context.py).
-    # Claude n'intervient pas dans cette boucle -- cout API ~nul sur ce mode.
-    #
-    # Le ticker change a chaque fenetre de 15min (ex: KXBTC15M-26APR221830-T105000),
-    # donc plutot que de le construire/deviner manuellement (risque d'erreur de
-    # fuseau horaire), on liste les marches actifs de la serie KXBTC15M et on
-    # choisit celui dont la cloture est la plus proche dans le temps -- c'est
-    # le marche "courant" sur lequel trader.
+    # ── Mode BTC 15min ────────────────────────────────────────────────────────
     if getattr(args, "btc", False) and BTC_AVAILABLE:
         from btc_context import evaluate_btc_trade
         from datetime import datetime as _dt, timezone as _tz
@@ -785,7 +758,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                     continue
                 delta = (close_dt - now_dt).total_seconds()
                 if delta <= 0:
-                    continue  # deja clos, ignore
+                    continue
                 if best_delta is None or delta < best_delta:
                     best, best_delta = m, delta
 
@@ -812,9 +785,15 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             except Exception:
                 pass
 
+        # ── CORRECTION v2 : passage des deux prix (YES et NO) ─────────────────
+        # L'ancienne version ne passait que yes_bid, forçant btc_context a
+        # calculer le prix NO comme (1 - yes_price), ce qui ignore le spread
+        # bid/ask reel de Kalshi. On passe maintenant no_bid explicitement
+        # pour que evaluate_btc_trade calcule l'edge NO avec le vrai prix.
         result = evaluate_btc_trade(
             strike_price=float(strike),
             market_yes_price_cents=int(market_data.get("yes_bid", 50)),
+            market_no_price_cents=int(market_data.get("no_bid", 50)),   # ← CORRECTION
             minutes_remaining=minutes_remaining,
             min_edge=getattr(args, "btc_min_edge", 0.04),
         )
@@ -955,15 +934,11 @@ def main():
     parser.add_argument("--btc-target",       type=float, default=0.0, help="Prix target BTC (fallback si strike API absent)")
     parser.add_argument("--btc-minutes",      type=int,   default=15,  help="Duree contrat BTC en minutes")
     parser.add_argument("--btc-ticker",       type=str,   default="",
-                        help="Ticker exact du marche BTC (ex: KXBTC15M-26JUN1814:00). Sans -- doit etre fourni car le ticker change a chaque fenetre de 15min.")
+                        help="Ticker exact du marche BTC (ex: KXBTC15M-26JUN1814:00).")
     parser.add_argument("--btc-min-edge",     type=float, default=0.04,
                         help="Edge minimum pour trader en mode BTC (defaut: 4%%)")
     args = parser.parse_args()
 
-    # Mode BTC : marche se renouvelle toutes les 15min, un cycle de 5min (defaut)
-    # est trop lent et laisse trop de temps mort entre deux observations.
-    # Si l'utilisateur n'a pas explicitement choisi --interval, on bascule
-    # automatiquement sur un rythme plus serre (60s) en mode --btc.
     if args.btc and args.interval == 300:
         args.interval = 60
         log.info("Mode BTC detecte -- intervalle ajuste automatiquement a 60s "
