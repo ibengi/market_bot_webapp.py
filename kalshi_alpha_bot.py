@@ -361,15 +361,27 @@ class KalshiClient:
         if "no_ask" not in m or m.get("no_ask") is None:
             m["no_ask"] = to_cents(m.get("no_ask_dollars"), None)
 
-        if m.get("yes_ask") is None:
-            m["yes_ask"] = max(1, min(99, 100 - int(m.get("no_bid", 50))))
-        if m.get("no_ask") is None:
-            m["no_ask"] = max(1, min(99, 100 - int(m.get("yes_bid", 50))))
+        # Reconstruction ask : yes_ask doit etre >= yes_bid
+        # yes_ask = yes_bid + spread (2-5c typique sur BTC15M)
+        yes_bid_val = max(1, min(99, int(m.get("yes_bid", 50))))
+        no_bid_val  = max(1, min(99, int(m.get("no_bid",  50))))
 
-        m["yes_bid"] = max(1, min(99, int(m.get("yes_bid", 50))))
-        m["no_bid"]  = max(1, min(99, int(m.get("no_bid",  50))))
-        m["yes_ask"] = max(1, min(99, int(m.get("yes_ask", 50))))
-        m["no_ask"]  = max(1, min(99, int(m.get("no_ask",  50))))
+        if m.get("yes_ask") is None:
+            # Spread typique de 2-3 cents sur BTC 15min
+            m["yes_ask"] = max(yes_bid_val, min(99, yes_bid_val + 3))
+        if m.get("no_ask") is None:
+            m["no_ask"]  = max(no_bid_val,  min(99, no_bid_val  + 3))
+
+        m["yes_bid"] = yes_bid_val
+        m["no_bid"]  = no_bid_val
+        m["yes_ask"] = max(1, min(99, int(m.get("yes_ask", yes_bid_val + 2))))
+        m["no_ask"]  = max(1, min(99, int(m.get("no_ask",  no_bid_val  + 2))))
+
+        # Sanity check : ask doit etre >= bid
+        if m["yes_ask"] < m["yes_bid"]:
+            m["yes_ask"] = m["yes_bid"] + 2
+        if m["no_ask"] < m["no_bid"]:
+            m["no_ask"]  = m["no_bid"]  + 2
 
         if "volume" not in m or m.get("volume") is None:
             m["volume"] = to_number(m.get("volume_fp"), 0)
