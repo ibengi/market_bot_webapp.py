@@ -68,10 +68,8 @@ try:
     BTC_AVAILABLE = True
 except ImportError:
     BTC_AVAILABLE = False
-    def get_btc_context(target_price=0, minutes=15):
-        return ""
-    def get_btc_price():
-        return 65000.0
+    def get_btc_context(target_price=0, minutes=15): return ""
+    def get_btc_price(): return 65000.0
     def record_trade_result(**kw): pass
     def get_performance_stats(): return {}
 
@@ -87,7 +85,7 @@ except ImportError:
 
 load_dotenv()
 
-# ── Logging UTF-8 (fix Windows) ───────────────────────────────────────────────
+# ── Logging UTF-8 ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -105,18 +103,17 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 KALSHI_KEY_ID     = os.getenv("KALSHI_KEY_ID", "")
 KALSHI_PRIV_KEY   = os.getenv("KALSHI_PRIVATE_KEY", "").replace("\\n", "\n")
 
-KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"   # LIVE
-KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"         # DEMO
+KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
+KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
-# ── Limites de securite LIVE ──────────────────────────────────────────────────
 MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
 
-# ── System prompt (Macro/CPI) ────────────────────────────────────────────────
+# ── System prompt Macro ───────────────────────────────────────────────────────
 SYSTEM_PROMPT_MACRO = """Tu es KALSHI MACRO ALPHA ENGINE V2.
 Mission unique : Detecter les erreurs de prix et identifier les trades a EV positive.
 JAMAIS : Predire. Avoir raison. Trader par intuition.
@@ -149,29 +146,20 @@ Reponds UNIQUEMENT en JSON valide (aucun markdown, aucun backtick) :
 
 REGLES ABSOLUES :
 - Somme scenarios = exactement 100%
-- prob_reelle dans phase6/phase10 doit TOUJOURS representer la probabilité du contrat YES/UP, pas seulement le côté préféré.
-- Tu dois comparer les deux côtés: edge_yes = prob_yes - prix_yes et edge_no = (1 - prob_yes) - prix_no.
-- Si edge_no > edge_yes et edge_no est positif, le verdict doit être ACHETER NO, même si ton intuition initiale était haussière.
-- EDGE final = edge du côté choisi.
+- prob_reelle dans phase6/phase10 represente TOUJOURS la probabilite du contrat YES.
+- Calcule edge_yes = prob_yes - prix_yes ET edge_no = (1 - prob_yes) - prix_no.
+- Si edge_no > edge_yes et edge_no positif : verdict = ACHETER NO.
+- EDGE final = edge du cote choisi.
 - EV nette = (P_gain x gain x 0.9755) - (P_perte x perte)
-- Si le meilleur edge < 3% OU confiance < 4 : verdict = AUCUN TRADE
+- Si meilleur edge < 3% OU confiance < 4 : verdict = AUCUN TRADE
 - verdict uniquement parmi : ACHETER YES / ACHETER NO / ATTENDRE / AUCUN TRADE
 - taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
 """
 
-# ── System prompt (Soccer / resultat de match) ───────────────────────────────
+# ── System prompt Soccer ──────────────────────────────────────────────────────
 SYSTEM_PROMPT_SOCCER = """Tu es KALSHI SOCCER ALPHA ENGINE.
 Mission unique : Detecter les erreurs de prix sur des marches de resultat de match
-de football/soccer (1X2 -- qui gagne) et identifier les trades a EV positive.
-JAMAIS : Predire par intuition ou supporterisme. Toujours raisonner par les faits
-disponibles (forme recente, contexte du match, enjeux, compositions probables,
-historique des confrontations, fatigue/calendrier, lieu du match).
-
-Tu n'as PAS acces a une API de stats sportives en temps reel : base ton analyse sur
-ta connaissance generale des equipes/joueurs/competitions et sur le contexte fourni
-(prix de marche Kalshi, volume, titre du marche, date du match). Si tu ne connais pas
-suffisamment les deux equipes pour juger, reduis fortement ta confiance plutot que
-d'inventer des informations.
+de football/soccer et identifier les trades a EV positive.
 
 Reponds UNIQUEMENT en JSON valide (aucun markdown, aucun backtick) :
 
@@ -201,27 +189,37 @@ Reponds UNIQUEMENT en JSON valide (aucun markdown, aucun backtick) :
 
 REGLES ABSOLUES :
 - Somme scenarios = exactement 100%
-- prob_reelle dans phase6/phase10 doit TOUJOURS representer la probabilité du contrat YES, pas seulement le côté préféré.
-- Tu dois comparer les deux côtés: edge_yes = prob_yes - prix_yes et edge_no = (1 - prob_yes) - prix_no.
-- Si edge_no > edge_yes et edge_no est positif, le verdict doit être ACHETER NO.
-- EDGE final = edge du côté choisi.
+- prob_reelle represente TOUJOURS la probabilite du contrat YES.
+- Calcule edge_yes = prob_yes - prix_yes ET edge_no = (1 - prob_yes) - prix_no.
+- Si edge_no > edge_yes et edge_no positif : verdict = ACHETER NO.
+- EDGE final = edge du cote choisi.
 - EV nette = (P_gain x gain x 0.9755) - (P_perte x perte)
-- Si le meilleur edge < 5% OU confiance < 5 : verdict = AUCUN TRADE (seuil plus strict que macro car
-  le sport a une variance intrinseque plus elevee qu'un indicateur economique)
-- Si liquidite_suffisante = false : verdict = AUCUN TRADE (impossible de sortir la position)
+- Si meilleur edge < 5% OU confiance < 5 : verdict = AUCUN TRADE
+- Si liquidite_suffisante = false : verdict = AUCUN TRADE
 - Si tu ne connais pas suffisamment les deux equipes : confiance <= 3 et verdict = AUCUN TRADE
 - verdict uniquement parmi : ACHETER YES / ACHETER NO / ATTENDRE / AUCUN TRADE
 - taille_position uniquement parmi : 0.5% / 1% / 2% / 5% / 10%
 """
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _safe_float(value, default=0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _normalize_probability(value) -> float:
+    p = _safe_float(value, 0.0)
+    if p > 1:
+        p = p / 100.0
+    return max(0.0, min(1.0, p))
+
+
 # ── Gestionnaire de risque journalier ────────────────────────────────────────
 class RiskManager:
-    """
-    Suit les pertes journalieres et bloque les trades si MAX_DAILY_LOSS est atteint.
-    Suit aussi le nombre de trades par cycle pour ne pas depasser MAX_TRADES_CYCLE.
-    Etat persiste dans risk_state.json, reinitialise chaque nouveau jour.
-    """
     RISK_FILE = "risk_state.json"
 
     def __init__(self, max_daily_loss: float, max_trades_cycle: int):
@@ -255,33 +253,22 @@ class RiskManager:
             self._save()
 
     def can_trade(self, trades_this_cycle: int):
-        """Retourne (True, '') si le trade est autorise, sinon (False, raison)."""
         self._refresh_day()
-
         if self._state["daily_loss"] >= self.max_daily_loss:
-            return False, (
-                f"STOP LOSS JOURNALIER atteint -- "
-                f"perte={self._state['daily_loss']:.2f}$ / limite={self.max_daily_loss:.2f}$"
-            )
-
+            return False, (f"STOP LOSS JOURNALIER atteint -- "
+                           f"perte={self._state['daily_loss']:.2f}$ / limite={self.max_daily_loss:.2f}$")
         if trades_this_cycle >= self.max_trades_cycle:
-            return False, (
-                f"LIMITE TRADES/CYCLE atteinte -- "
-                f"{trades_this_cycle}/{self.max_trades_cycle} trades ce cycle"
-            )
-
+            return False, (f"LIMITE TRADES/CYCLE atteinte -- "
+                           f"{trades_this_cycle}/{self.max_trades_cycle} trades ce cycle")
         return True, ""
 
     def record_trade(self, cost_dollars: float):
-        """Enregistre le cout (montant risque) d'un trade live execute."""
         self._refresh_day()
         self._state["daily_loss"]   += cost_dollars
         self._state["daily_trades"] += 1
         self._save()
-        log.info(
-            f"[RISK] Perte potentielle jour: {self._state['daily_loss']:.2f}$ / "
-            f"{self.max_daily_loss:.2f}$ | Trades jour: {self._state['daily_trades']}"
-        )
+        log.info(f"[RISK] Perte potentielle jour: {self._state['daily_loss']:.2f}$ / "
+                 f"{self.max_daily_loss:.2f}$ | Trades jour: {self._state['daily_trades']}")
 
     @property
     def daily_loss(self) -> float:
@@ -326,10 +313,8 @@ class KalshiClient:
             msg = f"{ts}{method.upper()}{urlparse(path).path}".encode()
             sig = self._pk.sign(
                 msg,
-                padding.PSS(
-                    mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.DIGEST_LENGTH,
-                ),
+                padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                            salt_length=padding.PSS.DIGEST_LENGTH),
                 hashes.SHA256(),
             )
             return {
@@ -350,43 +335,27 @@ class KalshiClient:
 
     @staticmethod
     def _normalize_market(m: dict) -> dict:
-        """
-        Normalise les champs Kalshi qui ont change de format au fil des versions API :
-        - yes_bid / yes_bid_dollars (dollars en string, ex "0.5600" -> 56 cents)
-        - no_bid  / no_bid_dollars
-        - volume  / volume_fp (peut etre une string numerique)
-        Garantit que 'yes_bid', 'no_bid' et 'volume' existent toujours avec
-        des types numeriques utilisables par le reste du bot.
-        """
         if not m:
             return m
 
-        def to_cents(dollars_str, fallback_cents):
-            if dollars_str is None:
-                return fallback_cents
-            try:
-                return int(round(float(dollars_str) * 100))
-            except (TypeError, ValueError):
-                return fallback_cents
+        def to_cents(v, fallback):
+            if v is None: return fallback
+            try: return int(round(float(v) * 100))
+            except: return fallback
 
-        def to_number(value, fallback=0):
-            if value is None:
-                return fallback
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return fallback
+        def to_number(v, fallback=0):
+            if v is None: return fallback
+            try: return float(v)
+            except: return fallback
 
-        m = dict(m)  # copie pour ne pas muter l'original
+        m = dict(m)
 
         if "yes_bid" not in m or m.get("yes_bid") is None:
             m["yes_bid"] = to_cents(m.get("yes_bid_dollars"), 50)
         if "no_bid" not in m or m.get("no_bid") is None:
             m["no_bid"] = to_cents(m.get("no_bid_dollars"), 50)
 
-        # IMPORTANT : pour ACHETER, le prix fiable est l'ASK.
-        # Si l'API ne donne pas yes_ask/no_ask, on reconstruit un prix prudent :
-        # yes_ask ≈ 100 - no_bid ; no_ask ≈ 100 - yes_bid.
+        # Reconstruit yes_ask / no_ask si absents
         if "yes_ask" not in m or m.get("yes_ask") is None:
             m["yes_ask"] = to_cents(m.get("yes_ask_dollars"), None)
         if "no_ask" not in m or m.get("no_ask") is None:
@@ -397,11 +366,10 @@ class KalshiClient:
         if m.get("no_ask") is None:
             m["no_ask"] = max(1, min(99, 100 - int(m.get("yes_bid", 50))))
 
-        # Empêche les prix incohérents de passer au moteur de décision.
         m["yes_bid"] = max(1, min(99, int(m.get("yes_bid", 50))))
-        m["no_bid"] = max(1, min(99, int(m.get("no_bid", 50))))
+        m["no_bid"]  = max(1, min(99, int(m.get("no_bid",  50))))
         m["yes_ask"] = max(1, min(99, int(m.get("yes_ask", 50))))
-        m["no_ask"] = max(1, min(99, int(m.get("no_ask", 50))))
+        m["no_ask"]  = max(1, min(99, int(m.get("no_ask",  50))))
 
         if "volume" not in m or m.get("volume") is None:
             m["volume"] = to_number(m.get("volume_fp"), 0)
@@ -434,20 +402,10 @@ class KalshiClient:
 
     def place_order(self, ticker: str, side: str, count: int,
                     price: int, dry_run: bool = False) -> dict:
-        """
-        Envoie un ordre sur Kalshi via l'endpoint V2 (/portfolio/events/orders).
-        dry_run=True  -> simulation locale uniquement (aucun appel API).
-        dry_run=False -> ordre reel envoye a l'API (live ou demo selon base_url).
-        """
         if dry_run:
             log.info(f"[DRY RUN] {side.upper()} {count}x {ticker} @ {price}c")
-            return {
-                "status": "dry_run",
-                "ticker": ticker,
-                "side":   side,
-                "count":  count,
-                "price":  price,
-            }
+            return {"status": "dry_run", "ticker": ticker,
+                    "side": side, "count": count, "price": price}
         try:
             price_dollars = f"{price / 100:.4f}"
             payload = {
@@ -460,7 +418,6 @@ class KalshiClient:
                 "time_in_force":             "good_till_canceled",
                 "self_trade_prevention_type": "taker_at_cross",
             }
-
             r = self._req("POST", "/portfolio/events/orders", json=payload)
             if not r.ok:
                 log.error(f"Detail Kalshi HTTP {r.status_code}: {r.text}")
@@ -468,7 +425,6 @@ class KalshiClient:
             result = r.json()
             log.info(f"ORDER PLACED: {result}")
             return result
-
         except Exception as e:
             log.error(f"Erreur place_order: {e}")
             if hasattr(e, "response") and e.response is not None:
@@ -476,16 +432,16 @@ class KalshiClient:
             return {"error": str(e)}
 
 
-# ── Moteur Claude avec retry ──────────────────────────────────────────────────
+# ── Moteur Claude ─────────────────────────────────────────────────────────────
 class AlphaEngine:
     def __init__(self, mode: str = "macro"):
         self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-        self.mode   = mode  # "macro" ou "soccer"
+        self.mode   = mode
 
     def analyse(self, market_data: dict, context: str = "",
                 retries: int = 3, delay: int = 5) -> dict:
+        system_prompt = SYSTEM_PROMPT_SOCCER if self.mode == "soccer" else SYSTEM_PROMPT_MACRO
         if self.mode == "soccer":
-            system_prompt = SYSTEM_PROMPT_SOCCER
             prompt = f"""
 MATCH A ANALYSER :
 - Ticker     : {market_data.get('ticker', 'N/A')}
@@ -495,16 +451,11 @@ MATCH A ANALYSER :
 - Prix NO    : {market_data.get('no_bid', 50)} cents
 - Volume     : {market_data.get('volume', 0)}
 - Cloture    : {market_data.get('close_time', 'N/A')}
-- Categorie  : {market_data.get('category', 'N/A')}
 
-CONTEXTE ADDITIONNEL :
-{context or 'Aucun contexte supplementaire fourni -- base-toi sur ta connaissance des equipes/competition.'}
-
-Lance l'analyse complete en 10 phases pour ce marche de resultat de match.
-Reponds uniquement en JSON valide.
+CONTEXTE : {context or 'Aucun -- base-toi sur ta connaissance des equipes.'}
+Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 """
         else:
-            system_prompt = SYSTEM_PROMPT_MACRO
             prompt = f"""
 MARCHE A ANALYSER :
 - Ticker    : {market_data.get('ticker', 'N/A')}
@@ -513,11 +464,8 @@ MARCHE A ANALYSER :
 - Prix NO   : {market_data.get('no_bid', 45)} cents
 - Volume    : {market_data.get('volume', 0)}
 - Cloture   : {market_data.get('close_time', 'N/A')}
-- Categorie : {market_data.get('category', 'N/A')}
 
-CONTEXTE ECONOMIQUE :
-{context or 'Aucun contexte supplementaire.'}
-
+CONTEXTE ECONOMIQUE : {context or 'Aucun contexte supplementaire.'}
 Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 """
         for attempt in range(1, retries + 1):
@@ -530,8 +478,7 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
                 )
                 raw = resp.content[0].text.strip()
                 raw = raw.replace("```json", "").replace("```", "").strip()
-                start = raw.find("{")
-                end   = raw.rfind("}") + 1
+                start = raw.find("{"); end = raw.rfind("}") + 1
                 if start >= 0 and end > start:
                     raw = raw[start:end]
                 return json.loads(raw)
@@ -540,163 +487,77 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
             except Exception as e:
                 log.error(f"Erreur Claude (tentative {attempt}/{retries}): {e}")
                 if attempt < retries:
-                    log.info(f"Retry dans {delay}s...")
                     time.sleep(delay)
         return {}
 
 
-# ── Gestionnaire de trades ────────────────────────────────────────────────────
-
-# ── Correction direction UP/DOWN / YES/NO ───────────────────────────────────
-def _safe_float(value, default=0.0) -> float:
-    """Convertit une valeur en float sans faire planter le bot."""
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _normalize_probability(value) -> float:
+# ── Decision bidirectionnelle YES/NO ─────────────────────────────────────────
+def make_btc_decision(market_data: dict, btc_result: dict) -> dict:
     """
-    Accepte 0.62 ou 62 et retourne toujours une probabilité entre 0 et 1.
+    Logique de decision BTC v5 -- seuil 60% dans les deux sens.
+
+    btc_context.evaluate_btc_trade retourne deja le bon verdict (YES ou NO).
+    Cette fonction construit la structure phase10 compatible avec le reste du bot.
+
+    IMPORTANT : on utilise le prix ASK pour l'achat (pas le BID).
     """
-    p = _safe_float(value, 0.0)
-    if p > 1:
-        p = p / 100.0
-    return max(0.0, min(1.0, p))
+    verdict       = btc_result.get("verdict", "AUCUN TRADE")
+    prob_yes_model = btc_result.get("prob_yes_model", btc_result.get("prob_reelle", 0.5))
+    prob_no_model  = btc_result.get("prob_no_model",  1.0 - prob_yes_model)
 
+    yes_ask = int(market_data.get("yes_ask", market_data.get("yes_bid", 50)))
+    no_ask  = int(market_data.get("no_ask",  market_data.get("no_bid",  50)))
 
-def rebalance_yes_no_decision(market_data: dict, analysis: dict, mode: str = "macro") -> dict:
-    """
-    Décision finale sans biais YES/UP.
-
-    Version prudente :
-    - utilise le prix d'achat ASK, pas le BID ;
-    - reconstruit un ASK conservateur si l'API ne le donne pas ;
-    - calcule YES et NO séparément ;
-    - retire une marge de sécurité pour frais + spread + erreur de modèle ;
-    - bloque le trade si les probabilités sont absentes, incohérentes ou trop proches.
-    """
-    if not analysis:
-        return analysis
-
-    p10 = analysis.setdefault("phase10", {})
-    p8 = analysis.setdefault("phase8", {})
-    p6 = analysis.setdefault("phase6", {})
-
-    def cents(name: str, fallback: int) -> int:
-        return max(1, min(99, int(_safe_float(market_data.get(name), fallback))))
-
-    yes_bid = cents("yes_bid", 50)
-    no_bid = cents("no_bid", 50)
-    yes_ask = cents("yes_ask", 100 - no_bid)
-    no_ask = cents("no_ask", 100 - yes_bid)
-
-    yes_cost = yes_ask / 100.0
-    no_cost = no_ask / 100.0
-
-    # prob_reelle doit représenter la probabilité du contrat YES.
-    prob_yes = _normalize_probability(p10.get("prob_reelle", 0.0))
-    if prob_yes <= 0:
-        prob_yes = _normalize_probability(p6.get("prob_reelle", 0.0))
-
-    if prob_yes <= 0 or prob_yes >= 1:
-        p10["verdict"] = "AUCUN TRADE"
-        p10["edge"] = 0.0
-        p10["raison_principale"] = (
-            "Trade bloqué : probabilité YES absente/invalide. "
-            "Le bot refuse de choisir YES ou NO sans probabilité exploitable."
-        )
-        return analysis
-
-    prob_no = 1.0 - prob_yes
-
-    # Edges bruts.
-    edge_yes_gross = prob_yes - yes_cost
-    edge_no_gross = prob_no - no_cost
-
-    # Marge de sécurité : frais Kalshi + spread + incertitude de modèle.
-    spread_yes = max(0.0, (yes_ask - yes_bid) / 100.0)
-    spread_no = max(0.0, (no_ask - no_bid) / 100.0)
-
-    model_buffer = {
-        "macro": 0.015,
-        "btc": 0.020,
-        "soccer": 0.030,
-    }.get(mode, 0.020)
-
-    fee_buffer = KALSHI_FEE_RATE
-    edge_yes_net = edge_yes_gross - fee_buffer - (spread_yes / 2.0) - model_buffer
-    edge_no_net = edge_no_gross - fee_buffer - (spread_no / 2.0) - model_buffer
-
-    if mode == "soccer":
-        min_edge, min_confidence = 0.05, 5
-    elif mode == "btc":
-        min_edge, min_confidence = 0.04, 3
+    if verdict == "ACHETER YES":
+        prob_r  = prob_yes_model
+        prob_m  = yes_ask / 100.0
+        price_c = yes_ask
+    elif verdict == "ACHETER NO":
+        prob_r  = prob_no_model
+        prob_m  = no_ask / 100.0
+        price_c = no_ask
     else:
-        min_edge, min_confidence = MIN_EDGE, MIN_CONFIDENCE
+        prob_r  = prob_yes_model
+        prob_m  = yes_ask / 100.0
+        price_c = yes_ask
 
-    confiance = int(_safe_float(p10.get("confiance", 0), 0))
-    old_verdict = p10.get("verdict", "")
+    ev_brute = prob_r * (1.0 - prob_m) - (1.0 - prob_r) * prob_m
+    ev_nette = prob_r * (1.0 - prob_m) * 0.9755 - (1.0 - prob_r) * prob_m
 
-    if edge_yes_net >= edge_no_net:
-        selected_side = "YES"
-        selected_prob = prob_yes
-        selected_cost = yes_cost
-        selected_edge_net = edge_yes_net
-        selected_edge_gross = edge_yes_gross
-        selected_price_cents = yes_ask
-    else:
-        selected_side = "NO"
-        selected_prob = prob_no
-        selected_cost = no_cost
-        selected_edge_net = edge_no_net
-        selected_edge_gross = edge_no_gross
-        selected_price_cents = no_ask
+    edge = btc_result.get("edge", prob_r - prob_m)
 
-    # Bloque les signaux faibles ou les marchés trop larges.
-    max_allowed_spread = 0.12 if mode == "soccer" else 0.08
-    selected_spread = spread_yes if selected_side == "YES" else spread_no
-
-    if (
-        selected_edge_net < min_edge
-        or confiance < min_confidence
-        or selected_spread > max_allowed_spread
-    ):
-        p10["verdict"] = "AUCUN TRADE"
-    else:
-        p10["verdict"] = "ACHETER YES" if selected_side == "YES" else "ACHETER NO"
-
-    gain = 1.0 - selected_cost
-    perte = selected_cost
-    ev_brute = selected_prob * gain - (1.0 - selected_prob) * perte
-    ev_nette = selected_prob * gain * (1.0 - KALSHI_FEE_RATE) - (1.0 - selected_prob) * perte
-
-    p10["prob_reelle"] = selected_prob
-    p10["prob_marche"] = selected_cost
-    p10["edge"] = selected_edge_net
-    p10["edge_brut"] = selected_edge_gross
-    p10["prix_achat_cents"] = selected_price_cents
-    p10["ev_brute"] = ev_brute
-    p10["ev_nette"] = ev_nette
-
-    p8["ev_brute"] = ev_brute
-    p8["ev_nette"] = ev_nette
-    p8["gain_potentiel"] = gain
-    p8["perte_potentielle"] = perte
-
-    p10["raison_principale"] = (
-        f"Décision finale recalculée avec ASK et marge de sécurité. "
-        f"YES ask={yes_ask}c, NO ask={no_ask}c, "
-        f"prob_yes={prob_yes:.1%}, prob_no={prob_no:.1%}, "
-        f"edge_net_yes={edge_yes_net:.1%}, edge_net_no={edge_no_net:.1%}. "
-        f"Côté retenu={selected_side}. Ancien verdict modèle={old_verdict or 'N/A'}."
+    log.info(
+        f"[BTC Decision] P(yes)={prob_yes_model:.1%} P(no)={prob_no_model:.1%} | "
+        f"yes_ask={yes_ask}c no_ask={no_ask}c | "
+        f"edge_yes={prob_yes_model - yes_ask/100:.1%} "
+        f"edge_no={prob_no_model - no_ask/100:.1%} | "
+        f"=> {verdict}"
     )
 
-    return analysis
+    return {
+        "phase10": {
+            "verdict":           verdict,
+            "prob_reelle":       round(prob_r, 4),
+            "prob_marche":       round(prob_m, 4),
+            "edge":              round(edge, 4),
+            "ev_brute":          round(ev_brute, 4),
+            "ev_nette":          round(ev_nette, 4),
+            "confiance":         btc_result.get("confiance", 0),
+            "risque":            btc_result.get("risque", 10),
+            "grade":             btc_result.get("grade", "D"),
+            "raison_principale": btc_result.get("raison_principale", ""),
+            "risque_principal":  btc_result.get("risque_principal", ""),
+            "risque_exogene":    btc_result.get("risque_exogene", ""),
+            "taille_position":   btc_result.get("taille_position", "0.5%"),
+            "prix_achat_cents":  price_c,
+        },
+        "phase8": {"ev_brute": round(ev_brute, 4), "ev_nette": round(ev_nette, 4)},
+        "phase9": {},
+        "phase5": {},
+    }
 
+
+# ── Gestionnaire de trades ────────────────────────────────────────────────────
 class TradeManager:
     def __init__(self, kalshi: KalshiClient, capital: float,
                  demo: bool, risk: RiskManager, mode: str = "macro",
@@ -727,7 +588,7 @@ class TradeManager:
         if self.mode == "soccer":
             min_edge, min_confidence = 0.05, 5
         elif self.mode == "btc":
-            min_edge, min_confidence = getattr(self, "btc_min_edge", 0.04), 3
+            min_edge, min_confidence = self.btc_min_edge, 3
         else:
             min_edge, min_confidence = MIN_EDGE, MIN_CONFIDENCE
 
@@ -740,23 +601,24 @@ class TradeManager:
             return None
 
         if self.mode == "soccer":
-            volume = market_data.get("volume", 0) or 0
-            if volume < 100:
-                log.warning(f"[{ticker}] BLOQUE -- volume insuffisant ({volume})")
+            if (market_data.get("volume", 0) or 0) < 100:
+                log.warning(f"[{ticker}] BLOQUE -- volume insuffisant")
                 return None
 
+        # Prix d'achat : utilise prix_achat_cents si disponible (ASK), sinon bid
         if verdict == "ACHETER YES":
-            side = "yes"
-            price = int(_safe_float(p10.get("prix_achat_cents", market_data.get("yes_ask", 50)), 50))
+            side  = "yes"
+            price = int(_safe_float(p10.get("prix_achat_cents",
+                        market_data.get("yes_ask", market_data.get("yes_bid", 50))), 50))
         elif verdict == "ACHETER NO":
-            side = "no"
-            price = int(_safe_float(p10.get("prix_achat_cents", market_data.get("no_ask", 50)), 50))
+            side  = "no"
+            price = int(_safe_float(p10.get("prix_achat_cents",
+                        market_data.get("no_ask", market_data.get("no_bid", 50))), 50))
         else:
             log.info(f"[{ticker}] ATTENDRE")
             return None
 
         price = max(1, min(99, price))
-
         count = self.compute_contracts(taille, price)
         if count <= 0:
             log.warning("Nombre de contrats = 0 -- trade annule.")
@@ -773,7 +635,6 @@ class TradeManager:
         if not self.demo and "error" not in result:
             self.risk.record_trade((price / 100) * count)
 
-        # Enregistre le trade pour la calibration BTC
         if self.mode == "btc" and BTC_AVAILABLE:
             try:
                 record_trade_result(verdict=verdict, edge=edge, won=False, pnl=0.0)
@@ -801,7 +662,6 @@ class TradeManager:
         return trade_log
 
     def save_state(self, analysis: dict, ticker: str, cycle: int):
-        """Ecrit l'etat courant pour le dashboard."""
         p10 = analysis.get("phase10", {})
         p8  = analysis.get("phase8",  {})
         p9  = analysis.get("phase9",  {})
@@ -862,17 +722,12 @@ def print_report(ticker: str, analysis: dict, demo: bool, risk: RiskManager):
     p8      = analysis.get("phase8",  {})
     verdict = p10.get("verdict", "AUCUN TRADE")
     grade   = p10.get("grade", "")
-    icon    = {
-        "ACHETER YES": "[YES]",
-        "ACHETER NO":  "[NO]",
-        "ATTENDRE":    "[WAIT]",
-        "AUCUN TRADE": "[SKIP]",
-    }.get(verdict, verdict)
-    mode_label = "DEMO" if demo else "LIVE"
+    icon    = {"ACHETER YES": "[YES]", "ACHETER NO": "[NO]",
+               "ATTENDRE": "[WAIT]", "AUCUN TRADE": "[SKIP]"}.get(verdict, verdict)
     sep = "=" * 62
     print(f"""
 {sep}
-  KALSHI ALPHA ENGINE V3 [{mode_label}] -- {ticker}
+  KALSHI ALPHA ENGINE V3 [{'DEMO' if demo else 'LIVE'}] -- {ticker}
   GRADE {grade:<4}  {icon}  {verdict}
 {sep}
   Prob reelle   : {p10.get('prob_reelle', 0):.1%}
@@ -929,12 +784,12 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
         from btc_context import evaluate_btc_trade
         from datetime import datetime as _dt, timezone as _tz
 
-        # Resolution des trades passes (apprentissage) -- tous les 5 cycles
+        # Resolution des trades passes tous les 5 cycles
         if RESOLVER_AVAILABLE and cycle % 5 == 1:
             try:
                 n_resolved = resolve_pending_trades(kalshi)
                 if n_resolved > 0:
-                    log.info(f"[Resolver] {n_resolved} trades resolus ce cycle -> modele mis a jour.")
+                    log.info(f"[Resolver] {n_resolved} trades resolus -> modele mis a jour.")
             except Exception as _e:
                 log.debug(f"[Resolver] Erreur: {_e}")
 
@@ -948,10 +803,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
         else:
             candidates = kalshi.get_active_markets("KXBTC15M")
             if not candidates:
-                log.warning(
-                    "Aucun marche KXBTC15M actif trouve -- verifie KALSHI_KEY_ID, "
-                    "ou precise --btc-ticker manuellement."
-                )
+                log.warning("Aucun marche KXBTC15M actif trouve.")
                 return 0
 
             now_dt = _dt.now(_tz.utc)
@@ -977,40 +829,36 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             market_data = best
 
         ticker = market_data.get("ticker", manual_ticker or "KXBTC15M")
-        strike = market_data.get("floor_strike") or market_data.get("strike_price") \
-                 or getattr(args, "btc_target", 0)
+        strike = (market_data.get("floor_strike") or market_data.get("strike_price")
+                  or getattr(args, "btc_target", 0))
         if not strike:
-            log.warning(f"Strike introuvable pour '{ticker}' -- impossible d'evaluer.")
+            log.warning(f"Strike introuvable pour '{ticker}'.")
             return 0
 
-        close_time = market_data.get("close_time")
         minutes_remaining = getattr(args, "btc_minutes", 15)
+        close_time = market_data.get("close_time")
         if close_time:
             try:
                 close_dt = _dt.fromisoformat(close_time.replace("Z", "+00:00"))
-                now_dt2  = _dt.now(_tz.utc)
-                minutes_remaining = max((close_dt - now_dt2).total_seconds() / 60.0, 0.1)
+                minutes_remaining = max((close_dt - _dt.now(_tz.utc)).total_seconds() / 60.0, 0.1)
             except Exception:
                 pass
 
-        # ── CORRECTION v2 : passage des deux prix (YES et NO) ─────────────────
-        # L'ancienne version ne passait que yes_bid, forçant btc_context a
-        # calculer le prix NO comme (1 - yes_price), ce qui ignore le spread
-        # bid/ask reel de Kalshi. On passe maintenant no_bid explicitement
-        # pour que evaluate_btc_trade calcule l'edge NO avec le vrai prix.
-        result = evaluate_btc_trade(
+        # Appel btc_context v5 -- logique 60% bidirectionnelle
+        btc_result = evaluate_btc_trade(
             strike_price=float(strike),
             market_yes_price_cents=int(market_data.get("yes_bid", 50)),
-            market_no_price_cents=int(market_data.get("no_bid", 50)),   # ← CORRECTION
+            market_no_price_cents=int(market_data.get("no_bid",  50)),
             minutes_remaining=minutes_remaining,
             min_edge=getattr(args, "btc_min_edge", 0.04),
         )
-        analysis = {"phase10": result, "phase8": {}, "phase9": {}, "phase5": {}}
-        analysis = rebalance_yes_no_decision(market_data, analysis, manager.mode)
+
+        # Construit la structure analysis avec prix ASK corrects
+        analysis = make_btc_decision(market_data, btc_result)
 
         log.info(
             f"[BTC] {ticker} | strike=${float(strike):,.2f} | "
-            f"t_restant={minutes_remaining:.1f}min | {result['raison_principale']}"
+            f"t={minutes_remaining:.1f}min | {btc_result.get('raison_principale', '')}"
         )
         print_report(ticker, analysis, manager.demo, manager.risk)
         manager.save_state(analysis, ticker, cycle)
@@ -1026,46 +874,22 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
         if not market_data:
             log.warning("Donnees Kalshi non disponibles -- donnees fictives utilisees")
-            if manager.mode == "soccer":
-                market_data = {
-                    "ticker":     args.market,
-                    "title":      f"Match {args.market}",
-                    "yes_bid":    50,
-                    "no_bid":     50,
-                    "volume":     0,
-                    "close_time": "N/A",
-                    "category":   "soccer",
-                    "subtitle":   "Donnees indisponibles",
-                }
-            else:
-                market_data = {
-                    "ticker":     args.market,
-                    "title":      f"Marche {args.market}",
-                    "yes_bid":    84,
-                    "no_bid":     16,
-                    "volume":     8000,
-                    "close_time": "2026-07-14T09:30:00Z",
-                    "category":   "economic",
-                    "subtitle":   "CPI June 2026",
-                }
+            market_data = {
+                "ticker": args.market, "title": f"Marche {args.market}",
+                "yes_bid": 50, "no_bid": 50, "yes_ask": 50, "no_ask": 50,
+                "volume": 0, "close_time": "N/A", "category": "economic",
+            }
 
         full_context = ""
-        if manager.mode == "soccer":
-            if args.context:
-                full_context = "CONTEXTE ADDITIONNEL: " + args.context
-        else:
-            fred_ctx = ""
+        if manager.mode != "soccer":
             if FRED_AVAILABLE and os.getenv("FRED_API_KEY"):
                 log.info("Recuperation contexte macro FRED...")
-                fred_ctx = get_macro_context(target="CPI")
-            if fred_ctx:
-                full_context += fred_ctx + "\n\n"
-            if args.context:
-                full_context += "CONTEXTE ADDITIONNEL: " + args.context
+                full_context = get_macro_context(target="CPI") + "\n\n"
+        if args.context:
+            full_context += "CONTEXTE ADDITIONNEL: " + args.context
 
         log.info("Lancement analyse Claude (10 phases)...")
         analysis = engine.analyse(market_data, context=full_context or args.context)
-        analysis = rebalance_yes_no_decision(market_data, analysis, manager.mode)
 
         if analysis:
             print_report(args.market, analysis, manager.demo, manager.risk)
@@ -1073,31 +897,25 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             trade = manager.execute(market_data, analysis, trades_this_cycle)
             if trade:
                 trades_this_cycle += 1
-                log.info(
-                    f"Trade execute: {trade.get('verdict')} | "
-                    f"Edge: {trade.get('edge', 0):.1%} | "
-                    f"Position: {trade.get('taille_position', '')}"
-                )
+                log.info(f"Trade execute: {trade.get('verdict')} | "
+                         f"Edge: {trade.get('edge', 0):.1%} | "
+                         f"Position: {trade.get('taille_position', '')}")
         else:
             log.error("Analyse vide -- aucun trade ce cycle.")
 
     # ── Mode scan ─────────────────────────────────────────────────────────────
     elif args.scan:
         default_series = "KXWCGAME" if manager.mode == "soccer" else "economic"
-        scan_category = getattr(args, "series", "") or default_series
+        scan_category  = getattr(args, "series", "") or default_series
         log.info(f"Scan des marches actifs (serie: {scan_category})...")
         markets = kalshi.get_active_markets(scan_category)
         if not markets:
-            log.warning(
-                f"Aucun marche trouve pour la serie '{scan_category}' -- "
-                f"verifie KALSHI_KEY_ID dans .env, ou essaie --series KXWC, --series KXWCWIN, etc."
-            )
+            log.warning(f"Aucun marche trouve pour '{scan_category}'.")
             return 0
         log.info(f"{len(markets)} marches trouves.")
         max_m = getattr(args, "max_markets", 0)
         if max_m > 0:
             markets = markets[:max_m]
-            log.info(f"Limite appliquee : {max_m} marches analyses ce cycle.")
         for market in markets:
             if not manager.demo:
                 ok, reason = manager.risk.can_trade(trades_this_cycle)
@@ -1107,7 +925,6 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             ticker = market.get("ticker", "")
             log.info(f"--- Analyse: {ticker} ---")
             analysis = engine.analyse(market, context=args.context)
-            analysis = rebalance_yes_no_decision(market, analysis, manager.mode)
             if analysis:
                 print_report(ticker, analysis, manager.demo, manager.risk)
                 manager.save_state(analysis, ticker, cycle)
@@ -1122,92 +939,69 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(description="Kalshi Macro Alpha Engine V3")
-    parser.add_argument("--market",           type=str,   help="Ticker Kalshi (ex: KXEPLGAME-... ou KXCPI-26JUN-T0.1)")
-    parser.add_argument("--scan",             action="store_true", help="Scan tous les marches economiques")
-    parser.add_argument("--soccer",           action="store_true",
-                        help="Mode soccer : analyse resultat de match (1X2) au lieu du mode macro")
-    parser.add_argument("--series",           type=str,   default="",
-                        help="Series Kalshi a scanner (ex: KXWC, KXEPLGAME). Defaut: KXWCGAME en mode soccer")
-    parser.add_argument("--max-markets",     type=int,   default=0,
-                        help="Nombre max de marches analyses par scan (0 = tous, defaut: 0)")
-    parser.add_argument("--demo",             action="store_true", default=False,
-                        help="Paper trading -- aucun ordre reel (defaut: LIVE)")
+    parser.add_argument("--market",           type=str)
+    parser.add_argument("--scan",             action="store_true")
+    parser.add_argument("--soccer",           action="store_true")
+    parser.add_argument("--series",           type=str,   default="")
+    parser.add_argument("--max-markets",      type=int,   default=0)
+    parser.add_argument("--demo",             action="store_true", default=False)
     parser.add_argument("--capital",          type=float, default=500.0)
     parser.add_argument("--context",          type=str,   default="")
-    parser.add_argument("--loop",             action="store_true", help="Boucle automatique")
-    parser.add_argument("--interval",         type=int,   default=300,
-                        help="Secondes entre cycles (defaut: 300)")
-    parser.add_argument("--max-daily-loss",   type=float, default=MAX_DAILY_LOSS,
-                        help=f"Stop loss journalier en $ (defaut: {MAX_DAILY_LOSS})")
-    parser.add_argument("--max-trades-cycle", type=int,   default=MAX_TRADES_CYCLE,
-                        help=f"Trades max par cycle (defaut: {MAX_TRADES_CYCLE})")
-    parser.add_argument("--btc",              action="store_true", help="Mode BTC 15min Kalshi")
-    parser.add_argument("--btc-target",       type=float, default=0.0, help="Prix target BTC (fallback si strike API absent)")
-    parser.add_argument("--btc-minutes",      type=int,   default=15,  help="Duree contrat BTC en minutes")
-    parser.add_argument("--btc-ticker",       type=str,   default="",
-                        help="Ticker exact du marche BTC (ex: KXBTC15M-26JUN1814:00).")
-    parser.add_argument("--btc-min-edge",     type=float, default=0.04,
-                        help="Edge minimum pour trader en mode BTC (defaut: 4%%)")
+    parser.add_argument("--loop",             action="store_true")
+    parser.add_argument("--interval",         type=int,   default=300)
+    parser.add_argument("--max-daily-loss",   type=float, default=MAX_DAILY_LOSS)
+    parser.add_argument("--max-trades-cycle", type=int,   default=MAX_TRADES_CYCLE)
+    parser.add_argument("--btc",              action="store_true")
+    parser.add_argument("--btc-target",       type=float, default=0.0)
+    parser.add_argument("--btc-minutes",      type=int,   default=15)
+    parser.add_argument("--btc-ticker",       type=str,   default="")
+    parser.add_argument("--btc-min-edge",     type=float, default=0.04)
     args = parser.parse_args()
 
     if args.btc and args.interval == 300:
         args.interval = 60
-        log.info("Mode BTC detecte -- intervalle ajuste automatiquement a 60s "
-                 "(utilise --interval pour forcer une autre valeur).")
+        log.info("Mode BTC -- intervalle ajuste a 60s.")
 
-    mode_label = "DEMO (paper trading)" if args.demo else "LIVE -- ORDRES REELS"
     market_mode = "soccer" if args.soccer else ("btc" if args.btc else "macro")
     sep = "=" * 62
-
     print("\n" + sep)
     print("   KALSHI MACRO ALPHA ENGINE V3")
     print(sep)
-    log.info(f"Mode          : {mode_label}")
-    log.info(f"Type marche   : {'BTC 15min (modele math, 0 cout Claude)' if args.btc else ('SOCCER (resultat de match)' if args.soccer else 'MACRO (economique)')}")
+    log.info(f"Mode          : {'DEMO' if args.demo else 'LIVE -- ORDRES REELS'}")
+    log.info(f"Type marche   : {'BTC 15min (seuil 60%)' if args.btc else market_mode.upper()}")
     log.info(f"Capital       : ${args.capital:,.2f}")
     log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
     log.info(f"Max trades/cyc: {args.max_trades_cycle}")
-    interval_label = f"{args.interval}s" if args.interval < 90 else f"{args.interval // 60} min"
-    log.info(f"Boucle        : {'OUI -- toutes les ' + interval_label if args.loop else 'NON'}")
-    log.info(f"Kalshi        : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE -- donnees fictives'}")
+    log.info(f"Boucle        : {'OUI -- ' + str(args.interval) + 's' if args.loop else 'NON'}")
+    log.info(f"Kalshi        : {'CLE CHARGEE' if KALSHI_KEY_ID else 'PAS DE CLE'}")
     log.info(f"Claude        : {'CLE OK' if ANTHROPIC_API_KEY else 'MANQUANTE'}")
 
-    # Affiche les stats de performance BTC au demarrage
     if args.btc and BTC_AVAILABLE:
         try:
             stats = get_performance_stats()
-            if stats["total"] > 0:
-                log.info(f"[PERF BTC] Trades passes : {stats['total']} | "
-                         f"Win rate : {stats['win_rate']:.1%} | "
-                         f"PnL total : ${stats['total_pnl']:.2f} | "
-                         f"drift_weight calibre : {stats['drift_weight']:.2f}")
+            if stats.get("total", 0) > 0:
+                log.info(f"[PERF BTC] {stats['total']} trades | "
+                         f"WR={stats['win_rate']:.1%} | PnL=${stats['total_pnl']:.2f} | "
+                         f"YES={stats.get('yes_trades',0)} trades WR={stats.get('yes_wr',0):.1%} | "
+                         f"NO={stats.get('no_trades',0)} trades WR={stats.get('no_wr',0):.1%}")
             else:
-                log.info("[PERF BTC] Aucun trade precedent enregistre -- demarrage a zero.")
+                log.info("[PERF BTC] Aucun trade precedent -- demarrage a zero.")
         except Exception:
             pass
 
     print(sep + "\n")
 
     if not ANTHROPIC_API_KEY:
-        log.error("ANTHROPIC_API_KEY manquant dans .env -- impossible de continuer.")
+        log.error("ANTHROPIC_API_KEY manquant -- impossible de continuer.")
         sys.exit(1)
-
     if not args.demo and not KALSHI_KEY_ID:
-        log.error("KALSHI_KEY_ID manquant dans .env -- impossible de trader en LIVE.")
-        log.error("Ajoutez --demo pour tester sans cle Kalshi.")
+        log.error("KALSHI_KEY_ID manquant -- impossible de trader en LIVE.")
         sys.exit(1)
-
     if not args.demo and not KALSHI_PRIV_KEY.strip():
-        log.error("KALSHI_PRIVATE_KEY manquant dans .env -- impossible de signer les ordres.")
+        log.error("KALSHI_PRIVATE_KEY manquant -- impossible de signer les ordres.")
         sys.exit(1)
-
     if not args.market and not args.scan and not args.btc:
         parser.print_help()
-        print("\nExemples :")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --loop                  # LIVE macro")
-        print("  python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop           # DEMO macro")
-        print("  python kalshi_alpha_bot.py --market KXEPLGAME-XXX --soccer --demo --loop     # DEMO soccer")
-        print("  python kalshi_alpha_bot.py --scan --loop --max-daily-loss 100                # LIVE scan")
         return
 
     risk    = RiskManager(args.max_daily_loss, args.max_trades_cycle)
@@ -1224,14 +1018,10 @@ def main():
             print(f"\n  Cycle #{cycle} termine -- {n} trade(s) -- Total: {total_trades}")
             if not args.demo:
                 print(f"  Perte potentielle jour: {risk.daily_loss:.2f}$ / {risk.max_daily_loss:.2f}$")
-
             if not args.loop:
-                log.info("Mode unique -- ajoute --loop pour tourner en continu.")
                 break
-
             cycle += 1
             countdown(args.interval, cycle)
-
     except KeyboardInterrupt:
         print(f"\n\n  Arret -- {cycle} cycle(s) -- {total_trades} trade(s) total\n")
         log.info(f"Bot arrete proprement apres {cycle} cycles et {total_trades} trades.")
