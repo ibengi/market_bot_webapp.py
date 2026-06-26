@@ -820,6 +820,8 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
 
             now_dt = _dt.now(_tz.utc)
             best, best_delta = None, None
+            MIN_MINUTES = 3.0   # ignore les marches avec moins de 3min restantes
+
             for m in candidates:
                 ct = m.get("close_time")
                 if not ct:
@@ -829,13 +831,16 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 except Exception:
                     continue
                 delta = (close_dt - now_dt).total_seconds()
-                if delta <= 0:
+                delta_min = delta / 60.0
+                # Ignore les marches expires ou avec trop peu de temps
+                if delta_min < MIN_MINUTES:
+                    log.debug(f"[BTC] Marche ignore (t={delta_min:.1f}min < {MIN_MINUTES}min): {m.get('ticker','?')}")
                     continue
                 if best_delta is None or delta < best_delta:
                     best, best_delta = m, delta
 
             if best is None:
-                log.warning("Aucun marche KXBTC15M avec close_time futur trouve.")
+                log.warning(f"Aucun marche KXBTC15M avec plus de {MIN_MINUTES}min restantes.")
                 return 0
 
             market_data = best
