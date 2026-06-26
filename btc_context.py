@@ -173,8 +173,8 @@ def _norm_cdf(x: float) -> float:
 def _recent_volatility() -> float:
     """Volatilite recente ramenee a 15min."""
     if len(_price_history) < 3:
-        # Fallback : ~50% annualisee ramenee a 15min
-        return 0.50 * math.sqrt(15 / (365 * 24 * 60))
+        # Fallback : ~90% annualisee ramenee a 15min (BTC court terme tres volatile)
+        return 0.90 * math.sqrt(15 / (365 * 24 * 60))
     now    = time.time()
     recent = [(t, p) for t, p in _price_history if t >= now - 3600]
     if len(recent) < 3:
@@ -182,7 +182,7 @@ def _recent_volatility() -> float:
     returns = [math.log(recent[i][1] / recent[i-1][1])
                for i in range(1, len(recent)) if recent[i-1][1] > 0]
     if len(returns) < 2:
-        return 0.50 * math.sqrt(15 / (365 * 24 * 60))
+        return 0.90 * math.sqrt(15 / (365 * 24 * 60))
     stdev = statistics.stdev(returns)
     span  = (recent[-1][0] - recent[0][0]) / 60 or 1
     per_obs = span / max(len(recent) - 1, 1)
@@ -200,32 +200,44 @@ def _recent_momentum(window_minutes: float = 5.0) -> float:
         return 0.0
     t0, p0 = recent[0]; t1, p1 = recent[-1]
     span = (t1 - t0) / 60
-    return math.log(p1 / p0) / span if span > 0 and p0 > 0 else 0.0
+    if span <= 0 or p0 <= 0:
+        return 0.0
+    raw_momentum = math.log(p1 / p0) / span
+    # Plafonne a +/-0.002 log/min (0.2%/min) pour eviter les valeurs aberrantes
+    # avec peu de points historiques
+    return max(-0.002, min(0.002, raw_momentum))
 
-def compute_prob_yes(price: float, strike: float, minutes: float) -> float:
+def compute_prob_yes(price: float, strike: float, minutes: float,
+                     mkt_yes_price: float = 0.50) -> float:
     """
     Calcule la probabilite que BTC finisse AU-DESSUS du strike.
 
-    Utilise Black-Scholes binaire avec momentum recent comme derive.
+    ANCRAGE AU PRIX DE MARCHE :
+    Le prix de marche Kalshi encode deja l'opinion collective des traders.
+    Notre modele BS est utilise comme signal directionnel (momentum/distance)
+    mais est ancre au prix de marche pour eviter les valeurs aberrantes.
+
+    Formule : prob_finale = 0.35 * prob_BS + 0.65 * mkt_yes_price
+    + ajustement momentum (plafonne a +/-8%)
+
     prob_no = 1 - prob_yes (toujours coherent, somme = 100%).
     """
     if price <= 0 or strike <= 0 or minutes <= 0:
-        return 0.5
+        return mkt_yes_price
 
-    vol      = _recent_volatility()
-    momentum = _recent_momentum()
-    sigma    = max(vol, 0.0001)
-    t        = max(minutes / 15.0, 0.01)
+    # Signal directionnel pur : distance au strike + momentum
+    dist_log = math.log(price / strike)  # positif si au-dessus
+    momentum = _recent_momentum()        # plafonne a +/-0.002/min
 
-    # Derive : momentum recente ponderee a 35%
-    mu = momentum * 0.35
+    # Ajustement momentum sur la duree restante (plafonne a +/-8%)
+    momentum_adj = max(-0.08, min(0.08, momentum * minutes * 0.35))
 
-    try:
-        d2 = (math.log(price / strike) + mu * minutes - 0.5 * sigma**2 * t) \
-             / (sigma * math.sqrt(t))
-        prob = _norm_cdf(d2)
-    except Exception:
-        prob = 0.5
+    # Signal distance : distance > 0 favorise YES, < 0 favorise NO
+    # Normalise : 0.1% de distance = +/-5% d ajustement
+    dist_adj = max(-0.10, min(0.10, dist_log / 0.002 * 0.05))
+
+    # Prob ancree au marche + ajustements plafonnes
+    prob = mkt_yes_price + dist_adj + momentum_adj
 
     return round(max(0.01, min(0.99, prob)), 4)
 
@@ -274,8 +286,10 @@ def evaluate_btc_trade(
             "prob_marche": market_yes_price_cents / 100.0,
         }
 
-    # ── Probabilites modele ───────────────────────────────────────────────────
-    prob_yes = compute_prob_yes(price, strike_price, minutes_remaining)
+    # ── Probabilites modele (ancrees au prix de marche) ──────────────────────
+    mkt_yes_frac = market_yes_price_cents / 100.0
+    prob_yes = compute_prob_yes(price, strike_price, minutes_remaining,
+                                mkt_yes_price=mkt_yes_frac)
     prob_no  = round(1.0 - prob_yes, 4)
 
     # ── Prix marche ───────────────────────────────────────────────────────────
