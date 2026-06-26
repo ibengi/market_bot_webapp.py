@@ -383,6 +383,26 @@ class KalshiClient:
             m["yes_bid"] = to_cents(m.get("yes_bid_dollars"), 50)
         if "no_bid" not in m or m.get("no_bid") is None:
             m["no_bid"] = to_cents(m.get("no_bid_dollars"), 50)
+
+        # IMPORTANT : pour ACHETER, le prix fiable est l'ASK.
+        # Si l'API ne donne pas yes_ask/no_ask, on reconstruit un prix prudent :
+        # yes_ask ≈ 100 - no_bid ; no_ask ≈ 100 - yes_bid.
+        if "yes_ask" not in m or m.get("yes_ask") is None:
+            m["yes_ask"] = to_cents(m.get("yes_ask_dollars"), None)
+        if "no_ask" not in m or m.get("no_ask") is None:
+            m["no_ask"] = to_cents(m.get("no_ask_dollars"), None)
+
+        if m.get("yes_ask") is None:
+            m["yes_ask"] = max(1, min(99, 100 - int(m.get("no_bid", 50))))
+        if m.get("no_ask") is None:
+            m["no_ask"] = max(1, min(99, 100 - int(m.get("yes_bid", 50))))
+
+        # Empêche les prix incohérents de passer au moteur de décision.
+        m["yes_bid"] = max(1, min(99, int(m.get("yes_bid", 50))))
+        m["no_bid"] = max(1, min(99, int(m.get("no_bid", 50))))
+        m["yes_ask"] = max(1, min(99, int(m.get("yes_ask", 50))))
+        m["no_ask"] = max(1, min(99, int(m.get("no_ask", 50))))
+
         if "volume" not in m or m.get("volume") is None:
             m["volume"] = to_number(m.get("volume_fp"), 0)
 
@@ -550,107 +570,132 @@ def _normalize_probability(value) -> float:
 
 def rebalance_yes_no_decision(market_data: dict, analysis: dict, mode: str = "macro") -> dict:
     """
-    Corrige l'anomalie où le bot reste biaisé sur UP/YES.
+    Décision finale sans biais YES/UP.
 
-    Principe :
-    - Claude ou le modèle donne une probabilité réelle du scénario YES/UP.
-    - Le bot calcule lui-même l'edge YES et l'edge NO.
-    - Il choisit le côté qui a le meilleur edge positif.
-    - Ainsi, si DOWN/NO est statistiquement meilleur, le verdict devient ACHETER NO.
-
-    Important :
-    Sur Kalshi, acheter NO n'est pas forcément égal à vendre YES.
-    Il faut donc comparer le vrai prix NO disponible, pas seulement faire 1 - prix YES.
+    Version prudente :
+    - utilise le prix d'achat ASK, pas le BID ;
+    - reconstruit un ASK conservateur si l'API ne le donne pas ;
+    - calcule YES et NO séparément ;
+    - retire une marge de sécurité pour frais + spread + erreur de modèle ;
+    - bloque le trade si les probabilités sont absentes, incohérentes ou trop proches.
     """
     if not analysis:
         return analysis
 
     p10 = analysis.setdefault("phase10", {})
     p8 = analysis.setdefault("phase8", {})
+    p6 = analysis.setdefault("phase6", {})
 
-    yes_price = int(_safe_float(market_data.get("yes_bid", 50), 50))
-    no_price = int(_safe_float(market_data.get("no_bid", 50), 50))
+    def cents(name: str, fallback: int) -> int:
+        return max(1, min(99, int(_safe_float(market_data.get(name), fallback))))
 
-    yes_market = max(0.01, min(0.99, yes_price / 100.0))
-    no_market = max(0.01, min(0.99, no_price / 100.0))
+    yes_bid = cents("yes_bid", 50)
+    no_bid = cents("no_bid", 50)
+    yes_ask = cents("yes_ask", 100 - no_bid)
+    no_ask = cents("no_ask", 100 - yes_bid)
 
-    # Par convention, prob_reelle = probabilité que le contrat YES/UP gagne.
-    prob_yes = _normalize_probability(p10.get("prob_reelle", analysis.get("prob_reelle", 0.0)))
+    yes_cost = yes_ask / 100.0
+    no_cost = no_ask / 100.0
+
+    # prob_reelle doit représenter la probabilité du contrat YES.
+    prob_yes = _normalize_probability(p10.get("prob_reelle", 0.0))
     if prob_yes <= 0:
-        prob_yes = _normalize_probability(analysis.get("phase6", {}).get("prob_reelle", 0.0))
+        prob_yes = _normalize_probability(p6.get("prob_reelle", 0.0))
 
-    # Si Claude n'a pas rempli prob_reelle, on ne force pas un trade.
-    if prob_yes <= 0:
+    if prob_yes <= 0 or prob_yes >= 1:
         p10["verdict"] = "AUCUN TRADE"
-        p10["raison_principale"] = "prob_reelle absente ou invalide; décision bloquée pour éviter un biais YES/UP."
+        p10["edge"] = 0.0
+        p10["raison_principale"] = (
+            "Trade bloqué : probabilité YES absente/invalide. "
+            "Le bot refuse de choisir YES ou NO sans probabilité exploitable."
+        )
         return analysis
 
     prob_no = 1.0 - prob_yes
 
-    yes_edge = prob_yes - yes_market
-    no_edge = prob_no - no_market
+    # Edges bruts.
+    edge_yes_gross = prob_yes - yes_cost
+    edge_no_gross = prob_no - no_cost
 
-    min_edge = 0.05 if mode == "soccer" else (0.04 if mode == "btc" else MIN_EDGE)
-    confiance = int(_safe_float(p10.get("confiance", 0), 0))
+    # Marge de sécurité : frais Kalshi + spread + incertitude de modèle.
+    spread_yes = max(0.0, (yes_ask - yes_bid) / 100.0)
+    spread_no = max(0.0, (no_ask - no_bid) / 100.0)
+
+    model_buffer = {
+        "macro": 0.015,
+        "btc": 0.020,
+        "soccer": 0.030,
+    }.get(mode, 0.020)
+
+    fee_buffer = KALSHI_FEE_RATE
+    edge_yes_net = edge_yes_gross - fee_buffer - (spread_yes / 2.0) - model_buffer
+    edge_no_net = edge_no_gross - fee_buffer - (spread_no / 2.0) - model_buffer
 
     if mode == "soccer":
-        min_confidence = 5
+        min_edge, min_confidence = 0.05, 5
     elif mode == "btc":
-        min_confidence = 3
+        min_edge, min_confidence = 0.04, 3
     else:
-        min_confidence = MIN_CONFIDENCE
+        min_edge, min_confidence = MIN_EDGE, MIN_CONFIDENCE
 
+    confiance = int(_safe_float(p10.get("confiance", 0), 0))
     old_verdict = p10.get("verdict", "")
 
-    if yes_edge >= no_edge and yes_edge >= min_edge and confiance >= min_confidence:
-        p10["verdict"] = "ACHETER YES"
-        p10["prob_reelle"] = prob_yes
-        p10["prob_marche"] = yes_market
-        p10["edge"] = yes_edge
-        selected_price = yes_market
+    if edge_yes_net >= edge_no_net:
+        selected_side = "YES"
         selected_prob = prob_yes
-        selected_side = "YES/UP"
-    elif no_edge > yes_edge and no_edge >= min_edge and confiance >= min_confidence:
-        p10["verdict"] = "ACHETER NO"
-        p10["prob_reelle"] = prob_no
-        p10["prob_marche"] = no_market
-        p10["edge"] = no_edge
-        selected_price = no_market
-        selected_prob = prob_no
-        selected_side = "NO/DOWN"
+        selected_cost = yes_cost
+        selected_edge_net = edge_yes_net
+        selected_edge_gross = edge_yes_gross
+        selected_price_cents = yes_ask
     else:
-        p10["verdict"] = "AUCUN TRADE"
-        p10["prob_reelle"] = max(prob_yes, prob_no)
-        p10["prob_marche"] = yes_market if yes_edge >= no_edge else no_market
-        p10["edge"] = max(yes_edge, no_edge)
-        selected_price = yes_market if yes_edge >= no_edge else no_market
-        selected_prob = prob_yes if yes_edge >= no_edge else prob_no
-        selected_side = "YES/UP" if yes_edge >= no_edge else "NO/DOWN"
+        selected_side = "NO"
+        selected_prob = prob_no
+        selected_cost = no_cost
+        selected_edge_net = edge_no_net
+        selected_edge_gross = edge_no_gross
+        selected_price_cents = no_ask
 
-    gain = 1.0 - selected_price
-    perte = selected_price
+    # Bloque les signaux faibles ou les marchés trop larges.
+    max_allowed_spread = 0.12 if mode == "soccer" else 0.08
+    selected_spread = spread_yes if selected_side == "YES" else spread_no
+
+    if (
+        selected_edge_net < min_edge
+        or confiance < min_confidence
+        or selected_spread > max_allowed_spread
+    ):
+        p10["verdict"] = "AUCUN TRADE"
+    else:
+        p10["verdict"] = "ACHETER YES" if selected_side == "YES" else "ACHETER NO"
+
+    gain = 1.0 - selected_cost
+    perte = selected_cost
     ev_brute = selected_prob * gain - (1.0 - selected_prob) * perte
     ev_nette = selected_prob * gain * (1.0 - KALSHI_FEE_RATE) - (1.0 - selected_prob) * perte
 
+    p10["prob_reelle"] = selected_prob
+    p10["prob_marche"] = selected_cost
+    p10["edge"] = selected_edge_net
+    p10["edge_brut"] = selected_edge_gross
+    p10["prix_achat_cents"] = selected_price_cents
     p10["ev_brute"] = ev_brute
     p10["ev_nette"] = ev_nette
+
     p8["ev_brute"] = ev_brute
     p8["ev_nette"] = ev_nette
     p8["gain_potentiel"] = gain
     p8["perte_potentielle"] = perte
 
-    reason = (
-        f"Décision recalculée sans biais: edge YES/UP={yes_edge:.1%}, "
-        f"edge NO/DOWN={no_edge:.1%}. Côté choisi: {selected_side}."
+    p10["raison_principale"] = (
+        f"Décision finale recalculée avec ASK et marge de sécurité. "
+        f"YES ask={yes_ask}c, NO ask={no_ask}c, "
+        f"prob_yes={prob_yes:.1%}, prob_no={prob_no:.1%}, "
+        f"edge_net_yes={edge_yes_net:.1%}, edge_net_no={edge_no_net:.1%}. "
+        f"Côté retenu={selected_side}. Ancien verdict modèle={old_verdict or 'N/A'}."
     )
-    old_reason = p10.get("raison_principale", "")
-    p10["raison_principale"] = reason + (f" Ancien verdict modèle: {old_verdict}." if old_verdict else "")
-    if old_reason:
-        p10["raison_principale"] += f" Analyse initiale: {old_reason[:160]}"
 
     return analysis
-
-
 
 class TradeManager:
     def __init__(self, kalshi: KalshiClient, capital: float,
@@ -701,12 +746,16 @@ class TradeManager:
                 return None
 
         if verdict == "ACHETER YES":
-            side, price = "yes", int(market_data.get("yes_bid", 50))
+            side = "yes"
+            price = int(_safe_float(p10.get("prix_achat_cents", market_data.get("yes_ask", 50)), 50))
         elif verdict == "ACHETER NO":
-            side, price = "no",  int(market_data.get("no_bid", 50))
+            side = "no"
+            price = int(_safe_float(p10.get("prix_achat_cents", market_data.get("no_ask", 50)), 50))
         else:
             log.info(f"[{ticker}] ATTENDRE")
             return None
+
+        price = max(1, min(99, price))
 
         count = self.compute_contracts(taille, price)
         if count <= 0:
@@ -957,6 +1006,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             min_edge=getattr(args, "btc_min_edge", 0.04),
         )
         analysis = {"phase10": result, "phase8": {}, "phase9": {}, "phase5": {}}
+        analysis = rebalance_yes_no_decision(market_data, analysis, manager.mode)
 
         log.info(
             f"[BTC] {ticker} | strike=${float(strike):,.2f} | "
