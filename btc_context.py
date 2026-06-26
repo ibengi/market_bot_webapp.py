@@ -275,6 +275,11 @@ def evaluate_btc_trade(
     _record_price(price)
 
     if len(_price_history) < min_history_points:
+        # Calcule quand meme les probabilites pour le log
+        # mais bloque le trade
+        mkt_yes_frac = market_yes_price_cents / 100.0
+        prob_yes_est = compute_prob_yes(price, strike_price, minutes_remaining,
+                                        mkt_yes_price=mkt_yes_frac)
         return {
             "verdict": "AUCUN TRADE",
             "raison_principale": (
@@ -282,8 +287,10 @@ def evaluate_btc_trade(
             ),
             "confiance": 0, "edge": 0.0,
             "ev_brute": 0.0, "ev_nette": 0.0,
-            "prob_reelle": 0.5,
-            "prob_marche": market_yes_price_cents / 100.0,
+            "prob_reelle":    mkt_yes_frac,
+            "prob_marche":    mkt_yes_frac,
+            "prob_yes_model": prob_yes_est,
+            "prob_no_model":  round(1.0 - prob_yes_est, 4),
         }
 
     # ── Probabilites modele (ancrees au prix de marche) ──────────────────────
