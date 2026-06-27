@@ -1,35 +1,29 @@
 """
-btc_context.py  --  v5  (Simple Probability Mode)
+btc_context.py  --  v6 SIMPLE
+Logique : si le marche dit YES >= 60c -> achete YES
+          si le marche dit NO  >= 60c -> achete NO
+          sinon -> aucun trade
 
-LOGIQUE SIMPLE ET CLAIRE :
-- Calcule la probabilite que BTC finisse AU-DESSUS du strike (prob_yes)
-- prob_no = 1 - prob_yes
-- Si prob_yes >= 60% → ACHETER YES
-- Si prob_no  >= 60% → ACHETER NO (i.e. prob_yes <= 40%)
-- Sinon → AUCUN TRADE
-
-Plus de Black-Scholes complexe -- juste la distance au strike,
-le temps restant, et le momentum recent.
+Pas de modele, pas de Black-Scholes.
+On suit le prix de marche directement.
 """
 
-import time, math, json, os, logging, statistics
+import time, json, os, logging, statistics
 from typing import Optional
 import requests
 
 log = logging.getLogger("BTCContext")
 
-PRICE_HISTORY_FILE  = "btc_price_history.json"
-TRADE_RESULTS_FILE  = "btc_trade_results.json"
-MAX_HISTORY_MINUTES = 240
+PRICE_HISTORY_FILE = "btc_price_history.json"
+TRADE_RESULTS_FILE = "btc_trade_results.json"
 
 _price_history  = []
 _history_loaded = False
 
-# ── Seuil de decision ────────────────────────────────────────────────────────
-THRESHOLD_BUY = 0.60   # achete YES si prob_yes >= 60%
-                        # achete NO  si prob_yes <= 40% (prob_no >= 60%)
+THRESHOLD = 60  # cents -- seuil de decision
 
-# ── Persistance historique prix ───────────────────────────────────────────────
+
+# ── Persistance prix (pour les stats) ────────────────────────────────────────
 
 def _load_price_history():
     global _price_history, _history_loaded
@@ -41,11 +35,10 @@ def _load_price_history():
     try:
         with open(PRICE_HISTORY_FILE, encoding="utf-8") as f:
             data = json.load(f)
-        cutoff = time.time() - MAX_HISTORY_MINUTES * 60
+        cutoff = time.time() - 240 * 60
         _price_history = [(t, p) for t, p in data if t >= cutoff]
-        log.info(f"[BTC] Historique charge: {len(_price_history)} points")
-    except Exception as e:
-        log.warning(f"[BTC] Erreur chargement historique: {e}")
+    except Exception:
+        pass
 
 def _save_price_history():
     try:
@@ -58,7 +51,7 @@ def _record_price(price: float):
     _load_price_history()
     now = time.time()
     _price_history.append((now, price))
-    cutoff = now - MAX_HISTORY_MINUTES * 60
+    cutoff = now - 240 * 60
     while _price_history and _price_history[0][0] < cutoff:
         _price_history.pop(0)
     if len(_price_history) % 5 == 0:
@@ -76,8 +69,8 @@ def record_trade_result(verdict: str, edge: float, won: bool, pnl: float = 0.0):
     try:
         with open(TRADE_RESULTS_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
-    except Exception as e:
-        log.warning(f"[BTC] Erreur sauvegarde: {e}")
+    except Exception:
+        pass
 
 def _load_trade_results() -> list:
     if not os.path.exists(TRADE_RESULTS_FILE):
@@ -91,347 +84,164 @@ def _load_trade_results() -> list:
 def get_performance_stats() -> dict:
     history = _load_trade_results()
     if not history:
-        return {"total": 0, "win_rate": 0.0, "total_pnl": 0.0}
-    total    = len(history)
-    wins     = sum(1 for t in history if t.get("won"))
+        return {"total": 0, "win_rate": 0.0, "total_pnl": 0.0,
+                "yes_trades": 0, "no_trades": 0, "yes_wr": 0.0, "no_wr": 0.0}
+    total     = len(history)
+    wins      = sum(1 for t in history if t.get("won"))
     total_pnl = sum(t.get("pnl", 0) for t in history)
-    yes_trades = [t for t in history if "YES" in t.get("verdict", "")]
-    no_trades  = [t for t in history if "NO"  in t.get("verdict", "")]
-    yes_wr = sum(1 for t in yes_trades if t.get("won")) / len(yes_trades) if yes_trades else 0
-    no_wr  = sum(1 for t in no_trades  if t.get("won")) / len(no_trades)  if no_trades  else 0
+    yes_t = [t for t in history if "YES" in t.get("verdict", "")]
+    no_t  = [t for t in history if "NO"  in t.get("verdict", "")]
     return {
         "total":      total,
         "win_rate":   wins / total,
         "total_pnl":  total_pnl,
-        "yes_trades": len(yes_trades),
-        "no_trades":  len(no_trades),
-        "yes_wr":     yes_wr,
-        "no_wr":      no_wr,
+        "yes_trades": len(yes_t),
+        "no_trades":  len(no_t),
+        "yes_wr":     sum(1 for t in yes_t if t.get("won")) / len(yes_t) if yes_t else 0,
+        "no_wr":      sum(1 for t in no_t  if t.get("won")) / len(no_t)  if no_t  else 0,
     }
 
 
-# ── Exchanges ─────────────────────────────────────────────────────────────────
+# ── Prix BTC (pour le log) ────────────────────────────────────────────────────
 
-def _fetch_coinbase() -> Optional[tuple]:
+def _fetch_coinbase() -> Optional[float]:
     try:
         r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=3)
         r.raise_for_status()
-        return float(r.json()["data"]["amount"]), 1.0
-    except Exception as e:
-        log.debug(f"Coinbase: {e}"); return None
+        return float(r.json()["data"]["amount"])
+    except Exception:
+        return None
 
-def _fetch_kraken() -> Optional[tuple]:
+def _fetch_kraken() -> Optional[float]:
     try:
         r = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=3)
         r.raise_for_status()
         d = r.json()["result"]
-        k = list(d.keys())[0]
-        return float(d[k]["c"][0]), float(d[k]["v"][1])
-    except Exception as e:
-        log.debug(f"Kraken: {e}"); return None
-
-def _fetch_gemini() -> Optional[tuple]:
-    try:
-        r = requests.get("https://api.gemini.com/v2/ticker/btcusd", timeout=3)
-        r.raise_for_status()
-        d = r.json()
-        return float(d["close"]), float(d.get("volume", {}).get("BTC", 1.0))
-    except Exception as e:
-        log.debug(f"Gemini: {e}"); return None
-
-def _fetch_bitstamp() -> Optional[tuple]:
-    try:
-        r = requests.get("https://www.bitstamp.net/api/v2/ticker/btcusd/", timeout=3)
-        r.raise_for_status()
-        d = r.json()
-        return float(d["last"]), float(d["volume"])
-    except Exception as e:
-        log.debug(f"Bitstamp: {e}"); return None
+        return float(d[list(d.keys())[0]]["c"][0])
+    except Exception:
+        return None
 
 def get_btc_price() -> Optional[float]:
     _load_price_history()
-    results = [r for r in [_fetch_coinbase(), _fetch_kraken(),
-                            _fetch_gemini(), _fetch_bitstamp()] if r]
-    if not results:
-        log.warning("Aucun exchange accessible."); return None
-    if len(results) == 1:
-        return results[0][0]
-    prices = [p for p, v in results]
-    med    = statistics.median(prices)
-    filt   = [(p, v) for p, v in results if abs(p - med) / med < 0.01] or results
-    tw     = sum(v for p, v in filt) or 1.0
-    wmean  = sum(p * v / tw for p, v in filt)
-    log.info(f"BTC price ({len(results)} exchanges): ${wmean:,.2f}")
-    return round(wmean, 2)
+    prices = [p for p in [_fetch_coinbase(), _fetch_kraken()] if p]
+    if not prices:
+        return None
+    price = sum(prices) / len(prices)
+    log.info(f"BTC price ({len(prices)} exchanges): ${price:,.2f}")
+    return round(price, 2)
+
+def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
+    price = get_btc_price()
+    stats = get_performance_stats()
+    return (
+        f"Prix BTC: ${price:,.2f} | Seuil decision: {THRESHOLD}c\n"
+        f"Trades: {stats['total']} | WR: {stats['win_rate']:.1%} | PnL: ${stats['total_pnl']:.2f}\n"
+        f"YES: {stats['yes_trades']} trades WR={stats['yes_wr']:.1%} | "
+        f"NO: {stats['no_trades']} trades WR={stats['no_wr']:.1%}"
+    )
 
 
-# ── Calcul de probabilite ─────────────────────────────────────────────────────
-
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-def _recent_volatility() -> float:
-    """Volatilite recente ramenee a 15min."""
-    if len(_price_history) < 3:
-        # Fallback : ~90% annualisee ramenee a 15min (BTC court terme tres volatile)
-        return 0.90 * math.sqrt(15 / (365 * 24 * 60))
-    now    = time.time()
-    recent = [(t, p) for t, p in _price_history if t >= now - 3600]
-    if len(recent) < 3:
-        recent = _price_history[-10:]
-    returns = [math.log(recent[i][1] / recent[i-1][1])
-               for i in range(1, len(recent)) if recent[i-1][1] > 0]
-    if len(returns) < 2:
-        return 0.90 * math.sqrt(15 / (365 * 24 * 60))
-    stdev = statistics.stdev(returns)
-    span  = (recent[-1][0] - recent[0][0]) / 60 or 1
-    per_obs = span / max(len(recent) - 1, 1)
-    return stdev * math.sqrt(15 / per_obs) if per_obs > 0 else stdev
-
-def _recent_momentum(window_minutes: float = 5.0) -> float:
-    """Drift recent en log-return/minute."""
-    if len(_price_history) < 2:
-        return 0.0
-    now    = time.time()
-    recent = [(t, p) for t, p in _price_history if t >= now - window_minutes * 60]
-    if len(recent) < 2:
-        recent = _price_history[-5:]
-    if len(recent) < 2:
-        return 0.0
-    t0, p0 = recent[0]; t1, p1 = recent[-1]
-    span = (t1 - t0) / 60
-    if span <= 0 or p0 <= 0:
-        return 0.0
-    raw_momentum = math.log(p1 / p0) / span
-    # Plafonne a +/-0.002 log/min (0.2%/min) pour eviter les valeurs aberrantes
-    # avec peu de points historiques
-    return max(-0.002, min(0.002, raw_momentum))
-
-def compute_prob_yes(price: float, strike: float, minutes: float,
-                     mkt_yes_price: float = 0.50) -> float:
-    """
-    Calcule la probabilite que BTC finisse AU-DESSUS du strike.
-
-    ANCRAGE AU PRIX DE MARCHE :
-    Le prix de marche Kalshi encode deja l'opinion collective des traders.
-    Notre modele BS est utilise comme signal directionnel (momentum/distance)
-    mais est ancre au prix de marche pour eviter les valeurs aberrantes.
-
-    Formule : prob_finale = 0.35 * prob_BS + 0.65 * mkt_yes_price
-    + ajustement momentum (plafonne a +/-8%)
-
-    prob_no = 1 - prob_yes (toujours coherent, somme = 100%).
-    """
-    if price <= 0 or strike <= 0 or minutes <= 0:
-        return mkt_yes_price
-
-    # Signal directionnel pur : distance au strike + momentum
-    dist_log = math.log(price / strike)  # positif si au-dessus
-    momentum = _recent_momentum()        # plafonne a +/-0.002/min
-
-    # Ajustement momentum sur la duree restante (plafonne a +/-8%)
-    momentum_adj = max(-0.08, min(0.08, momentum * minutes * 0.35))
-
-    # Signal distance : distance > 0 favorise YES, < 0 favorise NO
-    # Normalise : 0.1% de distance = +/-5% d ajustement
-    dist_adj = max(-0.10, min(0.10, dist_log / 0.002 * 0.05))
-
-    # Prob ancree au marche + ajustements plafonnes
-    prob = mkt_yes_price + dist_adj + momentum_adj
-
-    return round(max(0.01, min(0.99, prob)), 4)
-
-
-# ── Decision principale ───────────────────────────────────────────────────────
+# ── DECISION PRINCIPALE -- LOGIQUE SIMPLE ────────────────────────────────────
 
 def evaluate_btc_trade(
     strike_price: float,
     market_yes_price_cents: int,
     minutes_remaining: float,
-    min_edge: float = 0.04,
-    min_history_points: int = 3,
+    min_edge: float = 0.04,           # garde pour compatibilite mais non utilise
+    min_history_points: int = 1,      # reduit a 1 car on n'a plus besoin d'historique
     market_no_price_cents: int = None,
 ) -> dict:
     """
-    Logique de decision v5 -- simple et bidirectionnelle :
+    Logique v6 ULTRA-SIMPLE :
 
-    1. Calcule prob_yes = P(BTC > strike a expiration)
-    2. prob_no = 1 - prob_yes
-    3. Si prob_yes >= 60% ET edge_yes >= min_edge  → ACHETER YES
-    4. Si prob_no  >= 60% ET edge_no  >= min_edge  → ACHETER NO
-    5. Sinon → AUCUN TRADE
+    yes_price >= 60c  ->  ACHETER YES
+    no_price  >= 60c  ->  ACHETER NO
+    sinon             ->  AUCUN TRADE
 
-    Les deux directions sont evaluees exactement de la meme facon.
+    On suit le prix de marche directement, sans modele mathematique.
+    Le marche Kalshi encode deja l'opinion collective des traders.
+    Si 60% des traders pensent que le BTC va monter -> on achete YES.
+    Si 60% pensent qu'il va baisser             -> on achete NO.
     """
     price = get_btc_price()
-    if price is None:
-        return {
-            "verdict": "AUCUN TRADE",
-            "raison_principale": "Prix BTC indisponible.",
-            "confiance": 0, "edge": 0.0,
-            "ev_brute": 0.0, "ev_nette": 0.0,
-        }
+    if price:
+        _record_price(price)
 
-    _record_price(price)
-
-    if len(_price_history) < min_history_points:
-        # Calcule quand meme les probabilites pour le log
-        # mais bloque le trade
-        mkt_yes_frac = market_yes_price_cents / 100.0
-        prob_yes_est = compute_prob_yes(price, strike_price, minutes_remaining,
-                                        mkt_yes_price=mkt_yes_frac)
-        return {
-            "verdict": "AUCUN TRADE",
-            "raison_principale": (
-                f"Historique insuffisant ({len(_price_history)}/{min_history_points} points)."
-            ),
-            "confiance": 0, "edge": 0.0,
-            "ev_brute": 0.0, "ev_nette": 0.0,
-            "prob_reelle":    mkt_yes_frac,
-            "prob_marche":    mkt_yes_frac,
-            "prob_yes_model": prob_yes_est,
-            "prob_no_model":  round(1.0 - prob_yes_est, 4),
-        }
-
-    # ── Probabilites modele (ancrees au prix de marche) ──────────────────────
-    mkt_yes_frac = market_yes_price_cents / 100.0
-    prob_yes = compute_prob_yes(price, strike_price, minutes_remaining,
-                                mkt_yes_price=mkt_yes_frac)
-    prob_no  = round(1.0 - prob_yes, 4)
-
-    # ── Prix marche ───────────────────────────────────────────────────────────
-    mkt_yes = market_yes_price_cents / 100.0
-    mkt_no  = (market_no_price_cents / 100.0) if market_no_price_cents is not None \
-              else round(1.0 - mkt_yes, 4)
-
-    # ── Edges ────────────────────────────────────────────────────────────────
-    edge_yes = round(prob_yes - mkt_yes, 4)
-    edge_no  = round(prob_no  - mkt_no,  4)
+    yes_cents = market_yes_price_cents
+    no_cents  = market_no_price_cents if market_no_price_cents is not None \
+                else (100 - yes_cents)
 
     log.info(
-        f"[BTC] price=${price:,.0f} strike=${strike_price:,.0f} "
-        f"t={minutes_remaining:.1f}min | "
-        f"P(yes)={prob_yes:.1%} P(no)={prob_no:.1%} | "
-        f"mkt_yes={mkt_yes:.1%} mkt_no={mkt_no:.1%} | "
-        f"edge_yes={edge_yes:+.1%} edge_no={edge_no:+.1%}"
+        f"[BTC Simple] yes={yes_cents}c no={no_cents}c "
+        f"strike=${strike_price:,.2f} t={minutes_remaining:.1f}min | "
+        f"seuil={THRESHOLD}c dans les deux sens"
     )
 
-    # ── Decision : seuil 60% ─────────────────────────────────────────────────
-    can_buy_yes = (prob_yes >= THRESHOLD_BUY) and (edge_yes >= min_edge)
-    can_buy_no  = (prob_no  >= THRESHOLD_BUY) and (edge_no  >= min_edge)
+    # ── Decision ─────────────────────────────────────────────────────────────
+    if yes_cents >= THRESHOLD:
+        verdict    = "ACHETER YES"
+        prob_r     = yes_cents / 100.0
+        prob_m     = yes_cents / 100.0
+        edge       = 0.0   # on suit le marche, pas d'edge calcule
+        raison     = (f"YES a {yes_cents}c >= seuil {THRESHOLD}c "
+                      f"-> marche faveur UP | BTC=${price:,.0f} strike=${strike_price:,.0f}")
 
-    if can_buy_yes and can_buy_no:
-        # Les deux depassent 60% -- impossible en theorie (somme=100%)
-        # mais si ca arrive on prend le meilleur edge
-        if edge_yes >= edge_no:
-            can_buy_no = False
-        else:
-            can_buy_yes = False
+    elif no_cents >= THRESHOLD:
+        verdict    = "ACHETER NO"
+        prob_r     = no_cents / 100.0
+        prob_m     = no_cents / 100.0
+        edge       = 0.0
+        raison     = (f"NO a {no_cents}c >= seuil {THRESHOLD}c "
+                      f"-> marche faveur DOWN | BTC=${price:,.0f} strike=${strike_price:,.0f}")
 
-    if can_buy_yes:
-        verdict      = "ACHETER YES"
-        edge_taken   = edge_yes
-        prob_reelle  = prob_yes
-        prob_marche  = mkt_yes
-    elif can_buy_no:
-        verdict      = "ACHETER NO"
-        edge_taken   = edge_no
-        prob_reelle  = prob_no
-        prob_marche  = mkt_no
     else:
-        verdict      = "AUCUN TRADE"
-        edge_taken   = max(edge_yes, edge_no)
-        prob_reelle  = prob_yes
-        prob_marche  = mkt_yes
+        verdict    = "AUCUN TRADE"
+        prob_r     = yes_cents / 100.0
+        prob_m     = yes_cents / 100.0
+        edge       = 0.0
+        raison     = (f"Ni YES ({yes_cents}c) ni NO ({no_cents}c) n'atteint "
+                      f"le seuil de {THRESHOLD}c")
 
-    # ── Raison claire ────────────────────────────────────────────────────────
-    if verdict == "AUCUN TRADE":
-        if prob_yes >= THRESHOLD_BUY and edge_yes < min_edge:
-            raison = (f"YES probable ({prob_yes:.1%}) mais edge insuffisant "
-                      f"({edge_yes:+.1%} < {min_edge:.1%})")
-        elif prob_no >= THRESHOLD_BUY and edge_no < min_edge:
-            raison = (f"NO probable ({prob_no:.1%}) mais edge insuffisant "
-                      f"({edge_no:+.1%} < {min_edge:.1%})")
-        else:
-            raison = (f"Probabilites insuffisantes -- P(yes)={prob_yes:.1%} "
-                      f"P(no)={prob_no:.1%} (seuil: {THRESHOLD_BUY:.0%})")
+    # Confiance basee sur la distance au seuil
+    if verdict != "AUCUN TRADE":
+        active_cents = yes_cents if verdict == "ACHETER YES" else no_cents
+        distance     = active_cents - THRESHOLD          # ex: 72c -> distance=12
+        confiance    = min(10, max(3, 3 + distance // 3)) # 60c->3, 69c->6, 90c->10
     else:
-        direction = "AU-DESSUS" if verdict == "ACHETER YES" else "EN-DESSOUS"
-        raison = (
-            f"P({direction} strike)={prob_reelle:.1%} >= {THRESHOLD_BUY:.0%} | "
-            f"prix=${price:,.0f} strike=${strike_price:,.0f} | "
-            f"edge={edge_taken:+.1%} mkt={prob_marche:.1%}"
-        )
+        confiance = 0
 
-    # ── EV ───────────────────────────────────────────────────────────────────
-    ev_brute = prob_reelle * (1.0 - prob_marche) - (1.0 - prob_reelle) * prob_marche
-    ev_nette = prob_reelle * (1.0 - prob_marche) * 0.9755 \
-               - (1.0 - prob_reelle) * prob_marche
-
-    # ── Confiance basee sur distance a 50% ───────────────────────────────────
-    distance_from_50 = abs(prob_reelle - 0.5)
-    confiance = min(10, max(1, int(distance_from_50 * 40)))  # 60%->4, 70%->8, 75%->10
-
-    # ── Taille position ───────────────────────────────────────────────────────
+    # Taille position selon le prix
     if verdict == "AUCUN TRADE":
         taille = "0%"
-    elif prob_reelle >= 0.75:
+    elif (yes_cents if verdict == "ACHETER YES" else no_cents) >= 80:
         taille = "2%"
-    elif prob_reelle >= 0.65:
+    elif (yes_cents if verdict == "ACHETER YES" else no_cents) >= 70:
         taille = "1%"
     else:
         taille = "0.5%"
-
-    # ── Grade ─────────────────────────────────────────────────────────────────
-    if edge_taken > 0.15:   grade = "A"
-    elif edge_taken > 0.08: grade = "B"
-    elif edge_taken > 0.04: grade = "C"
-    else:                   grade = "D"
 
     stats = get_performance_stats()
 
     return {
         "verdict":           verdict,
-        "prob_reelle":       prob_reelle,
-        "prob_marche":       prob_marche,
-        "edge":              edge_taken,
-        "ev_brute":          round(ev_brute, 4),
-        "ev_nette":          round(ev_nette, 4),
+        "prob_reelle":       round(prob_r, 4),
+        "prob_marche":       round(prob_m, 4),
+        "prob_yes_model":    yes_cents / 100.0,
+        "prob_no_model":     no_cents  / 100.0,
+        "edge":              edge,
+        "ev_brute":          0.0,
+        "ev_nette":          0.0,
         "confiance":         confiance,
         "risque":            10 - confiance,
-        "grade":             grade,
+        "grade":             "A" if confiance >= 8 else "B" if confiance >= 5 else "C",
         "raison_principale": raison,
-        "risque_principal":  "Volatilite BTC peut devier brutalement (news, cascade).",
-        "risque_exogene":    "Slippage si carnet d'ordres fin.",
+        "risque_principal":  "Le marche peut se retourner rapidement sur BTC 15min.",
+        "risque_exogene":    "News ou liquidation cascade peuvent invalider le signal.",
         "taille_position":   taille,
-        # Infos supplementaires pour le log
-        "prob_yes_model":    prob_yes,
-        "prob_no_model":     prob_no,
-        "edge_yes":          edge_yes,
-        "edge_no":           edge_no,
-        "mkt_yes":           mkt_yes,
-        "mkt_no":            mkt_no,
-        "history_points":    len(_price_history),
+        "yes_cents":         yes_cents,
+        "no_cents":          no_cents,
+        "btc_price":         price or 0,
         "perf_total":        stats["total"],
         "perf_wr":           stats["win_rate"],
         "perf_pnl":          stats["total_pnl"],
     }
-
-
-def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
-    price = get_btc_price()
-    if price is None:
-        return "Donnees BTC indisponibles."
-    _record_price(price)
-    prob_yes = compute_prob_yes(price, target_price or price, minutes)
-    prob_no  = 1.0 - prob_yes
-    stats    = get_performance_stats()
-    return (
-        f"Prix BTC: ${price:,.2f} | Strike: ${target_price:,.2f}\n"
-        f"P(YES/above): {prob_yes:.1%}  P(NO/below): {prob_no:.1%}\n"
-        f"Seuil decision: {THRESHOLD_BUY:.0%} dans les deux sens\n"
-        f"Trades: {stats['total']} | WR: {stats['win_rate']:.1%} | "
-        f"PnL: ${stats['total_pnl']:.2f}\n"
-        f"YES: {stats['yes_trades']} trades WR={stats['yes_wr']:.1%} | "
-        f"NO: {stats['no_trades']} trades WR={stats['no_wr']:.1%}"
-    )

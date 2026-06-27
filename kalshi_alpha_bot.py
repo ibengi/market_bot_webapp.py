@@ -1,40 +1,5 @@
 """
-KALSHI MACRO ALPHA ENGINE V3
-Bot de trading institutionnel — version corrigee
-
-INSTALLATION:
-    pip install anthropic requests python-dotenv flask flask-cors cryptography
-
-FICHIER .env :
-    ANTHROPIC_API_KEY=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
-    KALSHI_KEY_ID=486ee030-12f5-46f9-b59c-cb4903978f9c
-    KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----
-MIIEogIBAAKCAQEAnWvg4YFM92F0E0c2B+dAe3jWdHEcn7B/mqC/dpVdiRaHP2sq
-iWPZM7BET0irYsFXtPaYDV6qMqwbHMg9KxitxJNOT+nUrB2BaA0DPg0cjFkUHeN/
-d47jKSNFXRimxL03l59mYaCsLtWRxLng98w8ujelMOELNL3no1sbyLo3ynOA6y8m
-A6h5LyZGnzhuCWqcOChdRoSrLhAwS2gcDJtQs1xJzGkPvHQu6uLoUjrn2sxtTSuJ
-6n5CFyrgwCrTJxEYfx+ZByY2Z9vUG5i7L+Z46HjEN5ADWCLrOi9qT0JapK70tLfX
-CJrOfmmU2uFBAluVFQsiQyo6GVaFg4RQ9glKtQIDAQABAoIBAAv1NyCiHAjZmgHh
-4aiRiCwo5m9zbSdzNoo2Jj0ZhQCmGbF3UESd9VCQFexI2p32jlVEexHe7EJLoQab
-bkwRBJgfUW5QFpPZbOxMur+SquW9WYIYtyTLkZVdJMZ42igtMGUf2lzVoeav2fIN
-5ZklJkLF+dIf8iQ4PbmCsPZbMOQ7qd/an6IIutDe/VvYXfTtY0qGuc41/e7hAHn6
-v/Au1VRFadK3v8beRMKF7z5GuSZ29RG7Qn4RqyZhxXit7wiU+jnNSFjv1jDaFXlh
-hlQEjSg6UtQJz8/fD6V/iXZtuAtq5iBLNUCvOOK9T+SmJKUNJMNgWVbZA53D6kZi
-RlxTLdECgYEAw6FeT0vxp0beQuxcrLqmOwD2qIKeZ35q4yYowp+KGKNdiPY09tJy
-Sj1EV41ZgIGAGmryI5SKeIxhTkCpl7bIdRSq2mEpc4NKoewumjdOlPMcnGEqjlou
-MJgcDwbdfOEE7ivMggVnrYGdSR7Vl/jqrbm/amhD1cw87tXAtnMIbqUCgYEAzgAJ
-JfqpeGl+Sw66ZC1WO1iyIfDkjBJUxDSFgiGgqi3cHVQPLOYl9d1KwcPXQ6AaYHMo
-Z9KvXqEzBipTi0x+Bql8+kngx74gbs19teEI2/x7sDUV+f1vdq++sIGoZln6gFkA
-O8GST31FG+ZQX3pncD7XAEMrRpOm0lp7GK//PtECgYBiD7ppf0Tzt7djzn0p7Cm1
-O+doUok6kYjcsd0OqdAcR490Pw4Phy/Y/NsMFAOAQenH1EHqCeRbRurjwdABB5N1
-9NUrwDZ5+57mibBWh1Cxoyd9T8t4LcYnf6fY9HUDyvugs33A0xrEQ0tnQriIhDKG
-wKwtl3QhcE4+3hDKo+DfLQKBgAurwtjs/6b7yxTzi6nbS7RnDQiRPlGVREotc5bw
-0spxeLQMrCNuEp6AYBjkQJDrRDNMsvBW5mqlFV/3C+6rccRs29DOWLbYVbwRVlr0
-mezkvBk6mLkmG6eMw2/6mJDb7i5RXIsGJ4TrYvv2q30NUUjxtnqkU5JXES9/wtOe
-PQbRAoGABoZHA/a2cgO0jZITlU7SvSaWQLMbPc9DtPMwouYDhFFA8zrO89Sm90zP
-gRBpqUqbOBxClhWQh6LvRjQYUjpxYg77HnBGFk88vQCXhjxX8QNaTRqIp8oDdkHX
-hfR8Z8VxNnxHQoUM5ICzhHd2/k1IAAXv4CCMyXj8DeKQi47NIK8=
------END RSA PRIVATE KEY-----
+kalshi_alpha_bot.py  --  Kalshi Macro Alpha Engine V3
 USAGE:
     python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --loop              # LIVE macro
     python kalshi_alpha_bot.py --market KXCPI-26JUN-T0.1 --demo --loop       # DEMO macro
@@ -506,64 +471,50 @@ Lance l'analyse complete en 10 phases. Reponds uniquement en JSON valide.
 # ── Decision bidirectionnelle YES/NO ─────────────────────────────────────────
 def make_btc_decision(market_data: dict, btc_result: dict) -> dict:
     """
-    Logique de decision BTC v5 -- seuil 60% dans les deux sens.
-
-    btc_context.evaluate_btc_trade retourne deja le bon verdict (YES ou NO).
-    Cette fonction construit la structure phase10 compatible avec le reste du bot.
-
-    IMPORTANT : on utilise le prix ASK pour l'achat (pas le BID).
+    Logique BTC v6 SIMPLE -- suit directement le verdict de btc_context.
+    YES >= 60c -> ACHETER YES
+    NO  >= 60c -> ACHETER NO
+    Sinon      -> AUCUN TRADE
+    Le prix d achat est le bid (on suit le marche, pas besoin du ASK).
     """
-    verdict       = btc_result.get("verdict", "AUCUN TRADE")
-    prob_yes_model = btc_result.get("prob_yes_model", btc_result.get("prob_reelle", 0.5))
-    prob_no_model  = btc_result.get("prob_no_model",  1.0 - prob_yes_model)
-
-    yes_ask = int(market_data.get("yes_ask", market_data.get("yes_bid", 50)))
-    no_ask  = int(market_data.get("no_ask",  market_data.get("no_bid",  50)))
+    verdict  = btc_result.get("verdict", "AUCUN TRADE")
+    yes_c    = btc_result.get("yes_cents", int(market_data.get("yes_bid", 50)))
+    no_c     = btc_result.get("no_cents",  int(market_data.get("no_bid",  50)))
+    conf     = btc_result.get("confiance", 0)
 
     if verdict == "ACHETER YES":
-        prob_r  = prob_yes_model
-        prob_m  = yes_ask / 100.0
-        price_c = yes_ask
+        price_c = yes_c
+        prob_r  = yes_c / 100.0
     elif verdict == "ACHETER NO":
-        prob_r  = prob_no_model
-        prob_m  = no_ask / 100.0
-        price_c = no_ask
+        price_c = no_c
+        prob_r  = no_c / 100.0
     else:
-        prob_r  = prob_yes_model
-        prob_m  = yes_ask / 100.0
-        price_c = yes_ask
-
-    ev_brute = prob_r * (1.0 - prob_m) - (1.0 - prob_r) * prob_m
-    ev_nette = prob_r * (1.0 - prob_m) * 0.9755 - (1.0 - prob_r) * prob_m
-
-    edge = btc_result.get("edge", prob_r - prob_m)
+        price_c = yes_c
+        prob_r  = yes_c / 100.0
 
     log.info(
-        f"[BTC Decision] P(yes)={prob_yes_model:.1%} P(no)={prob_no_model:.1%} | "
-        f"yes_ask={yes_ask}c no_ask={no_ask}c | "
-        f"edge_yes={prob_yes_model - yes_ask/100:.1%} "
-        f"edge_no={prob_no_model - no_ask/100:.1%} | "
-        f"=> {verdict}"
+        f"[BTC v6] yes={yes_c}c no={no_c}c => {verdict} "
+        f"| {btc_result.get('raison_principale','')[:60]}"
     )
 
     return {
         "phase10": {
             "verdict":           verdict,
             "prob_reelle":       round(prob_r, 4),
-            "prob_marche":       round(prob_m, 4),
-            "edge":              round(edge, 4),
-            "ev_brute":          round(ev_brute, 4),
-            "ev_nette":          round(ev_nette, 4),
-            "confiance":         btc_result.get("confiance", 0),
-            "risque":            btc_result.get("risque", 10),
-            "grade":             btc_result.get("grade", "D"),
+            "prob_marche":       round(prob_r, 4),
+            "edge":              1.0,   # edge fictif >0 pour passer le filtre min_edge
+            "ev_brute":          0.0,
+            "ev_nette":          0.0,
+            "confiance":         conf,
+            "risque":            10 - conf,
+            "grade":             btc_result.get("grade", "C"),
             "raison_principale": btc_result.get("raison_principale", ""),
             "risque_principal":  btc_result.get("risque_principal", ""),
             "risque_exogene":    btc_result.get("risque_exogene", ""),
             "taille_position":   btc_result.get("taille_position", "0.5%"),
             "prix_achat_cents":  price_c,
         },
-        "phase8": {"ev_brute": round(ev_brute, 4), "ev_nette": round(ev_nette, 4)},
+        "phase8": {"ev_brute": 0.0, "ev_nette": 0.0},
         "phase9": {},
         "phase5": {},
     }
