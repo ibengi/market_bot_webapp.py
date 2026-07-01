@@ -769,10 +769,14 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 log.warning("Aucun marche KXBTC15M actif trouve.")
                 return 0
 
-            now_dt = _dt.now(_tz.utc)
-            best, best_delta = None, None
-            MIN_MINUTES = 3.0   # ignore les marches avec moins de 3min restantes
+        now_dt = _dt.now(_tz.utc)
+            MIN_MINUTES = 5.0   # ignore les marches avec moins de 5min restantes
 
+            # Prix spot BTC : sert a choisir le marche "at-the-money", c.-a-d.
+            # celui dont le prix YES/NO reflete vraiment P(hausse)/P(baisse).
+            spot = get_btc_price()
+
+            best, best_score = None, None
             for m in candidates:
                 ct = m.get("close_time")
                 if not ct:
@@ -781,20 +785,33 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                     close_dt = _dt.fromisoformat(ct.replace("Z", "+00:00"))
                 except Exception:
                     continue
-                delta = (close_dt - now_dt).total_seconds()
-                delta_min = delta / 60.0
-                # Ignore les marches expires ou avec trop peu de temps
+                delta_min = (close_dt - now_dt).total_seconds() / 60.0
                 if delta_min < MIN_MINUTES:
                     log.debug(f"[BTC] Marche ignore (t={delta_min:.1f}min < {MIN_MINUTES}min): {m.get('ticker','?')}")
                     continue
-                if best_delta is None or delta < best_delta:
-                    best, best_delta = m, delta
+
+                strike = m.get("floor_strike") or m.get("strike_price")
+
+                if spot is not None and strike is not None:
+                    # Priorite 1 : echeance la plus proche (arrondie a la minute)
+                    # Priorite 2 : strike le plus proche du spot (marche ATM)
+                    score = (round(delta_min), abs(float(strike) - spot))
+                else:
+                    score = (delta_min, 0.0)
+
+                if best_score is None or score < best_score:
+                    best, best_score = m, score
 
             if best is None:
-                log.warning(f"Aucun marche KXBTC15M avec plus de {MIN_MINUTES}min restantes.")
+                log.warning(f"Aucun marche KXBTC15M avec plus de {MIN_MINUTES}min restantes -- attente prochaine fenetre.")
                 return 0
 
-            market_data = best
+            if spot is not None:
+                _bs = best.get("floor_strike") or best.get("strike_price")
+                log.info(f"[BTC] Marche ATM selectionne: {best.get('ticker','?')} "
+                         f"| strike={_bs} | spot=${spot:,.2f}")
+
+            market_data = best  
 
         ticker = market_data.get("ticker", manual_ticker or "KXBTC15M")
         strike = (market_data.get("floor_strike") or market_data.get("strike_price")
