@@ -769,7 +769,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 log.warning("Aucun marche KXBTC15M actif trouve.")
                 return 0
 
-        now_dt = _dt.now(_tz.utc)
+            now_dt = _dt.now(_tz.utc)
             MIN_MINUTES = 5.0   # ignore les marches avec moins de 5min restantes
 
             # Prix spot BTC : sert a choisir le marche "at-the-money", c.-a-d.
