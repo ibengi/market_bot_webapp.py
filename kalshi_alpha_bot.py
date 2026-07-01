@@ -75,7 +75,7 @@ KALSHI_FEE_RATE   = 0.0245
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
-MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
+MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "10000.0"))
 MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
 
 # ── System prompt Macro ───────────────────────────────────────────────────────
