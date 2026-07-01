@@ -1,1 +1,1 @@
-worker: python kalshi_alpha_bot.py --btc --loop
+worker: python kalshi_alpha_bot.py --btc --loop --demo
