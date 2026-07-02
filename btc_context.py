@@ -14,6 +14,8 @@ import requests
 
 log = logging.getLogger("BTCContext")
 
+VERSION = "v7-fix-2026-07-02"
+
 PRICE_HISTORY_FILE = "btc_price_history.json"
 TRADE_RESULTS_FILE = "btc_trade_results.json"
 

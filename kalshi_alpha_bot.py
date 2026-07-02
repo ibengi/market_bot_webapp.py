@@ -72,6 +72,7 @@ KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
+BOT_VERSION       = "v7-fix-2026-07-02"
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
@@ -1009,6 +1010,12 @@ def main():
     print("   KALSHI MACRO ALPHA ENGINE V3")
     print(sep)
     log.info(f"Mode          : {'DEMO' if args.demo else 'LIVE -- ORDRES REELS'}")
+    try:
+        import btc_context as _bc
+        _bc_ver = getattr(_bc, "VERSION", "ANCIENNE VERSION (pas de constante VERSION)")
+    except ImportError:
+        _bc_ver = "non importe"
+    log.info(f"VERSION CODE  : bot={BOT_VERSION} | btc_context={_bc_ver}")
     log.info(f"Type marche   : {'BTC 15min (seuil 60%)' if args.btc else market_mode.upper()}")
     log.info(f"Capital       : ${args.capital:,.2f}")
     log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
