@@ -133,8 +133,11 @@ def get_btc_price() -> Optional[float]:
 def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
     price = get_btc_price()
     stats = get_performance_stats()
+    # FIX : si Coinbase ET Kraken echouent, price vaut None et
+    # f"${price:,.2f}" levait un TypeError qui faisait planter le cycle.
+    price_txt = f"${price:,.2f}" if price is not None else "indisponible"
     return (
-        f"Prix BTC: ${price:,.2f} | Seuil decision: {THRESHOLD}c\n"
+        f"Prix BTC: {price_txt} | Seuil decision: {THRESHOLD}c\n"
         f"Trades: {stats['total']} | WR: {stats['win_rate']:.1%} | PnL: ${stats['total_pnl']:.2f}\n"
         f"YES: {stats['yes_trades']} trades WR={stats['yes_wr']:.1%} | "
         f"NO: {stats['no_trades']} trades WR={stats['no_wr']:.1%}"
@@ -166,10 +169,21 @@ def evaluate_btc_trade(
     price = get_btc_price()
     if price:
         _record_price(price)
+    # FIX : si les deux APIs de prix echouent, price est None et les
+    # f-strings "${price:,.0f}" plus bas levaient un TypeError -> crash du
+    # cycle complet. On formate le prix une seule fois, de facon sure.
+    price_txt = f"${price:,.0f}" if price is not None else "N/A"
 
-    yes_cents = market_yes_price_cents
-    no_cents  = market_no_price_cents if market_no_price_cents is not None \
+    yes_cents = int(market_yes_price_cents)
+    no_cents  = int(market_no_price_cents) if market_no_price_cents is not None \
                 else (100 - yes_cents)
+
+    # Garde-fou : yes + no doit valoir ~100c. Un gros ecart signale des
+    # donnees de carnet incoherentes -> on ne trade pas dessus.
+    if abs((yes_cents + no_cents) - 100) > 15:
+        log.warning(f"[BTC] Carnet incoherent: yes={yes_cents}c + no={no_cents}c "
+                    f"!= 100c -- AUCUN TRADE ce cycle.")
+        yes_cents = no_cents = 50  # force le verdict AUCUN TRADE plus bas
 
     log.info(
         f"[BTC Simple] yes={yes_cents}c no={no_cents}c "
@@ -184,7 +198,7 @@ def evaluate_btc_trade(
         prob_m     = yes_cents / 100.0
         edge       = 0.0   # on suit le marche, pas d'edge calcule
         raison     = (f"YES a {yes_cents}c >= seuil {THRESHOLD}c "
-                      f"-> marche faveur UP | BTC=${price:,.0f} strike=${strike_price:,.0f}")
+                      f"-> marche faveur UP | BTC={price_txt} strike=${strike_price:,.0f}")
 
     elif no_cents >= THRESHOLD:
         verdict    = "ACHETER NO"
@@ -192,7 +206,7 @@ def evaluate_btc_trade(
         prob_m     = no_cents / 100.0
         edge       = 0.0
         raison     = (f"NO a {no_cents}c >= seuil {THRESHOLD}c "
-                      f"-> marche faveur DOWN | BTC=${price:,.0f} strike=${strike_price:,.0f}")
+                      f"-> marche faveur DOWN | BTC={price_txt} strike=${strike_price:,.0f}")
 
     else:
         verdict    = "AUCUN TRADE"

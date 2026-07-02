@@ -9,7 +9,7 @@ USAGE:
     python kalshi_alpha_bot.py --btc --loop                                  # LIVE BTC 15min
 """
 
-import os, json, time, sys, argparse, logging, base64
+import os, json, time, sys, argparse, logging, base64, uuid
 from datetime import datetime, date
 from typing import Optional
 from urllib.parse import urlparse
@@ -75,7 +75,7 @@ KALSHI_FEE_RATE   = 0.0245
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
-MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "10000.0"))
+MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
 
 # ── System prompt Macro ───────────────────────────────────────────────────────
@@ -315,38 +315,53 @@ class KalshiClient:
 
         m = dict(m)
 
-        if "yes_bid" not in m or m.get("yes_bid") is None:
-            m["yes_bid"] = to_cents(m.get("yes_bid_dollars"), 50)
-        if "no_bid" not in m or m.get("no_bid") is None:
-            m["no_bid"] = to_cents(m.get("no_bid_dollars"), 50)
+        def pick_cents(cent_key, dollar_key):
+            """Retourne le prix en cents, ou None s'il est vraiment absent."""
+            v = m.get(cent_key)
+            if v is not None:
+                try:
+                    return int(round(float(v)))
+                except (TypeError, ValueError):
+                    pass
+            return to_cents(m.get(dollar_key), None)
 
-        # Reconstruit yes_ask / no_ask si absents
-        if "yes_ask" not in m or m.get("yes_ask") is None:
-            m["yes_ask"] = to_cents(m.get("yes_ask_dollars"), None)
-        if "no_ask" not in m or m.get("no_ask") is None:
-            m["no_ask"] = to_cents(m.get("no_ask_dollars"), None)
+        yes_bid = pick_cents("yes_bid", "yes_bid_dollars")
+        yes_ask = pick_cents("yes_ask", "yes_ask_dollars")
+        no_bid  = pick_cents("no_bid",  "no_bid_dollars")
+        no_ask  = pick_cents("no_ask",  "no_ask_dollars")
 
-        # Reconstruction ask : yes_ask doit etre >= yes_bid
-        # yes_ask = yes_bid + spread (2-5c typique sur BTC15M)
-        yes_bid_val = max(1, min(99, int(m.get("yes_bid", 50))))
-        no_bid_val  = max(1, min(99, int(m.get("no_bid",  50))))
+        # ── FIX BUG "achete uniquement YES" ──────────────────────────────────
+        # Ancien comportement : si no_bid manquait, il retombait sur 50c.
+        # Consequence : le seuil "no >= 60c" ne se declenchait JAMAIS quand
+        # l'API ne renvoyait que le carnet YES -> le bot ne pouvait acheter
+        # que du YES. On derive maintenant le cote NO du cote YES
+        # (identite Kalshi : no_bid = 100 - yes_ask ; no_ask = 100 - yes_bid).
+        if no_bid is None and yes_ask is not None:
+            no_bid = 100 - yes_ask
+        if no_ask is None and yes_bid is not None:
+            no_ask = 100 - yes_bid
+        # Et symetriquement si seul le cote NO est connu.
+        if yes_bid is None and no_ask is not None:
+            yes_bid = 100 - no_ask
+        if yes_ask is None and no_bid is not None:
+            yes_ask = 100 - no_bid
 
-        if m.get("yes_ask") is None:
-            # Spread typique de 2-3 cents sur BTC 15min
-            m["yes_ask"] = max(yes_bid_val, min(99, yes_bid_val + 3))
-        if m.get("no_ask") is None:
-            m["no_ask"]  = max(no_bid_val,  min(99, no_bid_val  + 3))
+        # Derniers recours (aucune donnee) : marche 50/50 neutre -> aucun trade.
+        if yes_bid is None: yes_bid = 50
+        if no_bid  is None: no_bid  = 50
+        if yes_ask is None: yes_ask = min(99, yes_bid + 3)
+        if no_ask  is None: no_ask  = min(99, no_bid  + 3)
 
-        m["yes_bid"] = yes_bid_val
-        m["no_bid"]  = no_bid_val
-        m["yes_ask"] = max(1, min(99, int(m.get("yes_ask", yes_bid_val + 2))))
-        m["no_ask"]  = max(1, min(99, int(m.get("no_ask",  no_bid_val  + 2))))
+        m["yes_bid"] = max(1, min(99, int(yes_bid)))
+        m["no_bid"]  = max(1, min(99, int(no_bid)))
+        m["yes_ask"] = max(1, min(99, int(yes_ask)))
+        m["no_ask"]  = max(1, min(99, int(no_ask)))
 
         # Sanity check : ask doit etre >= bid
         if m["yes_ask"] < m["yes_bid"]:
-            m["yes_ask"] = m["yes_bid"] + 2
+            m["yes_ask"] = min(99, m["yes_bid"] + 2)
         if m["no_ask"] < m["no_bid"]:
-            m["no_ask"]  = m["no_bid"]  + 2
+            m["no_ask"]  = min(99, m["no_bid"] + 2)
 
         if "volume" not in m or m.get("volume") is None:
             m["volume"] = to_number(m.get("volume_fp"), 0)
@@ -384,18 +399,34 @@ class KalshiClient:
             return {"status": "dry_run", "ticker": ticker,
                     "side": side, "count": count, "price": price}
         try:
-            price_dollars = f"{price / 100:.4f}"
+            # ── FIX BUG ordres NO ────────────────────────────────────────────
+            # Ancien payload : side="bid" + outcome_side=..., count en string
+            # decimale, price en dollars, endpoint /portfolio/events/orders.
+            # Ce format ne correspond pas a l'API Kalshi trade-api v2
+            # documentee : les ordres NO pouvaient etre rejetes ou mal
+            # interpretes (=> le bot semblait n'acheter que du YES).
+            # Format v2 documente : POST /portfolio/orders avec
+            # action=buy/sell, side=yes/no, type=limit, count entier,
+            # yes_price OU no_price en cents entiers.
+            # NOTE : verifiez ce schema dans la doc Kalshi actuelle
+            # (https://trading-api.readme.io / docs.kalshi.com), l'API évolue.
+            side = side.lower().strip()
+            if side not in ("yes", "no"):
+                log.error(f"place_order: side invalide '{side}' -- ordre annule.")
+                return {"error": f"invalid side {side}"}
             payload = {
-                "ticker":                    ticker,
-                "client_order_id":           f"alpha_{int(time.time())}",
-                "side":                      "bid",
-                "outcome_side":              side,
-                "count":                     f"{count:.2f}",
-                "price":                     price_dollars,
-                "time_in_force":             "good_till_canceled",
-                "self_trade_prevention_type": "taker_at_cross",
+                "ticker":          ticker,
+                "client_order_id": f"alpha_{uuid.uuid4().hex}",
+                "action":          "buy",
+                "side":            side,
+                "type":            "limit",
+                "count":           int(count),
             }
-            r = self._req("POST", "/portfolio/events/orders", json=payload)
+            if side == "yes":
+                payload["yes_price"] = int(price)
+            else:
+                payload["no_price"] = int(price)
+            r = self._req("POST", "/portfolio/orders", json=payload)
             if not r.ok:
                 log.error(f"Detail Kalshi HTTP {r.status_code}: {r.text}")
             r.raise_for_status()
@@ -475,18 +506,28 @@ def make_btc_decision(market_data: dict, btc_result: dict) -> dict:
     YES >= 60c -> ACHETER YES
     NO  >= 60c -> ACHETER NO
     Sinon      -> AUCUN TRADE
-    Le prix d achat est le bid (on suit le marche, pas besoin du ASK).
+    FIX : le prix d'achat est desormais le ASK du cote choisi (execution
+    immediate en croisant le spread). L'ancien code posait un ordre limite
+    GTC au BID : il ne se remplissait que si le marche baissait jusqu'a
+    nous, c'est-a-dire exactement quand le signal s'invalidait
+    (anti-selection), ou restait pendu sans jamais se remplir.
     """
     verdict  = btc_result.get("verdict", "AUCUN TRADE")
     yes_c    = btc_result.get("yes_cents", int(market_data.get("yes_bid", 50)))
     no_c     = btc_result.get("no_cents",  int(market_data.get("no_bid",  50)))
     conf     = btc_result.get("confiance", 0)
 
+    MAX_SPREAD_PAY = 5  # ne jamais payer plus de bid+5c (protection spread anormal)
+
     if verdict == "ACHETER YES":
-        price_c = yes_c
+        bid     = int(market_data.get("yes_bid", yes_c))
+        ask     = int(market_data.get("yes_ask", bid + 2))
+        price_c = min(ask, bid + MAX_SPREAD_PAY)
         prob_r  = yes_c / 100.0
     elif verdict == "ACHETER NO":
-        price_c = no_c
+        bid     = int(market_data.get("no_bid", no_c))
+        ask     = int(market_data.get("no_ask", bid + 2))
+        price_c = min(ask, bid + MAX_SPREAD_PAY)
         prob_r  = no_c / 100.0
     else:
         price_c = yes_c
@@ -534,8 +575,10 @@ class TradeManager:
         self.trades       = []
 
     def compute_contracts(self, taille_pct: str, price_cents: int) -> int:
-        pct = {"0.5%": .005, "1%": .01, "2%": .02, "5%": .05, "10%": .10}.get(taille_pct, .01)
-        if price_cents <= 0:
+        # FIX : une taille inconnue (ex: "0%") retombait sur 1% du capital.
+        # Desormais : taille inconnue ou nulle -> 0 contrat -> trade annule.
+        pct = {"0.5%": .005, "1%": .01, "2%": .02, "5%": .05, "10%": .10}.get(taille_pct)
+        if pct is None or price_cents <= 0:
             return 0
         return max(1, int(self.capital * pct / (price_cents / 100)))
 
@@ -598,11 +641,12 @@ class TradeManager:
         if not self.demo and "error" not in result:
             self.risk.record_trade((price / 100) * count)
 
-        if self.mode == "btc" and BTC_AVAILABLE:
-            try:
-                record_trade_result(verdict=verdict, edge=edge, won=False, pnl=0.0)
-            except Exception:
-                pass
+        # ── FIX stats faussees ───────────────────────────────────────────────
+        # Ancien code : record_trade_result(won=False, pnl=0) etait appele ICI,
+        # au moment de l'achat -> chaque trade etait immediatement compte
+        # comme PERDU. Le win rate affiche restait donc a 0% quoi qu'il
+        # arrive. Le resultat reel doit etre enregistre uniquement par le
+        # resolver (trade_resolver.py) une fois le marche resolu.
 
         trade_log = {
             "timestamp":       datetime.now().isoformat(),
@@ -829,11 +873,23 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
             except Exception:
                 pass
 
-        # Appel btc_context v5 -- logique 60% bidirectionnelle
+        # ── FIX symetrie UP/DOWN ─────────────────────────────────────────────
+        # Ancien code : decision sur yes_bid et no_bid pris separement.
+        # Avec un spread large, les deux bids peuvent etre sous 60c en meme
+        # temps, et l'asymetrie du carnet biaisait la decision.
+        # Nouveau : prix mid du carnet YES -> prob(UP) ; prob(DOWN) = 100 - mid.
+        # UP et DOWN sont ainsi traites de facon strictement symetrique.
+        yes_bid_c = int(market_data.get("yes_bid", 50))
+        yes_ask_c = int(market_data.get("yes_ask", yes_bid_c))
+        yes_mid_c = int(round((yes_bid_c + yes_ask_c) / 2))
+        no_mid_c  = 100 - yes_mid_c
+        log.info(f"[BTC] Carnet: yes {yes_bid_c}/{yes_ask_c}c "
+                 f"(mid={yes_mid_c}c) | no mid={no_mid_c}c")
+
         btc_result = evaluate_btc_trade(
             strike_price=float(strike),
-            market_yes_price_cents=int(market_data.get("yes_bid", 50)),
-            market_no_price_cents=int(market_data.get("no_bid",  50)),
+            market_yes_price_cents=yes_mid_c,
+            market_no_price_cents=no_mid_c,
             minutes_remaining=minutes_remaining,
             min_edge=getattr(args, "btc_min_edge", 0.04),
         )
