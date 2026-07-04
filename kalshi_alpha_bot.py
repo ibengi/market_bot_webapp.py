@@ -79,12 +79,22 @@ KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
-BOT_VERSION       = "v9-datafix-2026-07-04"
+BOT_VERSION       = "v10-protections-2026-07-04"
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
 MAX_DAILY_LOSS   = float(os.getenv("MAX_DAILY_LOSS", "50.0"))
 MAX_TRADES_CYCLE = int(os.getenv("MAX_TRADES_CYCLE", "3"))
+
+# ── Protections de strategie v10 -- configurables par variables d'env ────────
+# MAX_ENTRY_CENTS : prix d'achat maximum. Au-dela, le ratio risque/gain
+#   devient absurde (ex: acheter a 99c = risquer 99 pour gagner 1).
+# ONE_TRADE_PER_MARKET : 1 = un seul trade par ticker jusqu'a sa resolution
+#   (empeche d'accumuler des positions opposees a perte garantie).
+# BTC_MIN_MINUTES : ignorer les marches avec moins de X minutes restantes.
+MAX_ENTRY_CENTS      = int(os.getenv("MAX_ENTRY_CENTS", "85"))
+ONE_TRADE_PER_MARKET = os.getenv("ONE_TRADE_PER_MARKET", "1").strip().lower() not in ("0", "false", "no", "non")
+BTC_MIN_MINUTES      = float(os.getenv("BTC_MIN_MINUTES", "5"))
 
 # ── System prompt Macro ───────────────────────────────────────────────────────
 SYSTEM_PROMPT_MACRO = """Tu es KALSHI MACRO ALPHA ENGINE V2.
@@ -567,9 +577,24 @@ def make_btc_decision(market_data: dict, btc_result: dict) -> dict:
         price_c = yes_c
         prob_r  = yes_c / 100.0
 
+    # ── Protection v10 : plafond de prix d'entree ────────────────────────────
+    # Acheter a 99c = risquer 99 pour gagner 1 : un seul retournement efface
+    # ~99 trades gagnants. Au-dela de MAX_ENTRY_CENTS, on n'entre pas.
+    raison = btc_result.get("raison_principale", "")
+    taille = btc_result.get("taille_position", "0.5%")
+    if verdict in ("ACHETER YES", "ACHETER NO") and price_c > MAX_ENTRY_CENTS:
+        log.info(f"[BTC] Prix d'entree {price_c}c > plafond {MAX_ENTRY_CENTS}c "
+                 f"-- trade annule (ratio risque/gain defavorable). "
+                 f"Reglable via MAX_ENTRY_CENTS.")
+        verdict = "AUCUN TRADE"
+        conf    = 0
+        taille  = "0%"
+        raison  = (f"Prix d'entree {price_c}c > plafond {MAX_ENTRY_CENTS}c "
+                   f"-- ratio risque/gain trop defavorable")
+
     log.info(
         f"[BTC v6] yes={yes_c}c no={no_c}c => {verdict} "
-        f"| {btc_result.get('raison_principale','')[:60]}"
+        f"| {raison[:60]}"
     )
 
     return {
@@ -582,11 +607,11 @@ def make_btc_decision(market_data: dict, btc_result: dict) -> dict:
             "ev_nette":          0.0,
             "confiance":         conf,
             "risque":            10 - conf,
-            "grade":             btc_result.get("grade", "C"),
-            "raison_principale": btc_result.get("raison_principale", ""),
+            "grade":             btc_result.get("grade", "C") if verdict != "AUCUN TRADE" else "C",
+            "raison_principale": raison,
             "risque_principal":  btc_result.get("risque_principal", ""),
             "risque_exogene":    btc_result.get("risque_exogene", ""),
-            "taille_position":   btc_result.get("taille_position", "0.5%"),
+            "taille_position":   taille,
             "prix_achat_cents":  price_c,
         },
         "phase8": {"ev_brute": 0.0, "ev_nette": 0.0},
@@ -607,6 +632,25 @@ class TradeManager:
         self.mode         = mode
         self.btc_min_edge = btc_min_edge
         self.trades       = []
+        # ── Protection v10 : un seul trade par marche ────────────────────────
+        # Sans memoire de position, le bot suivait chaque bascule du marche
+        # et accumulait des positions OPPOSEES sur le meme ticker
+        # (= perte garantie). On memorise les tickers deja trades, recharges
+        # depuis kalshi_trades.json pour survivre a un redemarrage du process
+        # (mais pas a un redeploiement : systeme de fichiers ephemere).
+        self.traded_tickers: set = set()
+        try:
+            if os.path.exists("kalshi_trades.json"):
+                with open("kalshi_trades.json", encoding="utf-8") as f:
+                    for t in json.load(f):
+                        tk = t.get("ticker")
+                        if tk:
+                            self.traded_tickers.add(tk)
+                if self.traded_tickers:
+                    log.info(f"[TradeManager] {len(self.traded_tickers)} ticker(s) "
+                             f"deja trade(s) recharges depuis kalshi_trades.json.")
+        except Exception:
+            pass
 
     def compute_contracts(self, taille_pct: str, price_cents: int) -> int:
         # FIX : une taille inconnue (ex: "0%") retombait sur 1% du capital.
@@ -632,12 +676,21 @@ class TradeManager:
         else:
             min_edge, min_confidence = MIN_EDGE, MIN_CONFIDENCE
 
+        # Edge fictif (1.0) en mode BTC : l'afficher serait trompeur.
+        edge_txt = "N/A (suivi de marche)" if self.mode == "btc" else f"{edge:.1%}"
+
         if verdict == "AUCUN TRADE":
-            log.info(f"[{ticker}] AUCUN TRADE -- edge={edge:.1%} conf={confiance}/10")
+            log.info(f"[{ticker}] AUCUN TRADE -- edge={edge_txt} conf={confiance}/10")
+            return None
+
+        # ── Protection v10 : un seul trade par marche ────────────────────────
+        if ONE_TRADE_PER_MARKET and ticker in self.traded_tickers:
+            log.info(f"[{ticker}] IGNORE -- position deja prise sur ce marche "
+                     f"(protection 1 trade/marche; ONE_TRADE_PER_MARKET=0 pour desactiver).")
             return None
 
         if edge < min_edge or confiance < min_confidence:
-            log.warning(f"[{ticker}] BLOQUE -- edge={edge:.1%} conf={confiance}/10")
+            log.warning(f"[{ticker}] BLOQUE -- edge={edge_txt} conf={confiance}/10")
             return None
 
         if self.mode == "soccer":
@@ -671,6 +724,9 @@ class TradeManager:
                 return None
 
         result = self.kalshi.place_order(ticker, side, count, price, dry_run=self.demo)
+
+        # Protection v10 : memoriser le ticker pour ne plus le retrader.
+        self.traded_tickers.add(ticker)
 
         if not self.demo and "error" not in result:
             self.risk.record_trade((price / 100) * count)
@@ -773,7 +829,7 @@ def print_report(ticker: str, analysis: dict, demo: bool, risk: RiskManager):
 {sep}
   Prob reelle   : {p10.get('prob_reelle', 0):.1%}
   Prob marche   : {p10.get('prob_marche', 0):.1%}
-  Edge          : {p10.get('edge', 0):.1%}
+  Edge          : {'N/A (suivi de marche)' if p10.get('edge', 0) >= 1.0 else format(p10.get('edge', 0), '.1%')}
   EV brute      : {p8.get('ev_brute', p10.get('ev_brute', 0)):.1%}
   EV nette      : {p8.get('ev_nette', p10.get('ev_nette', 0)):.1%}
   Confiance     : {p10.get('confiance', 0)}/10
@@ -848,7 +904,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 return 0
 
             now_dt = _dt.now(_tz.utc)
-            MIN_MINUTES = 5.0   # ignore les marches avec moins de 5min restantes
+            MIN_MINUTES = BTC_MIN_MINUTES  # protection v10 : reglable via BTC_MIN_MINUTES
 
             # Prix spot BTC : sert a choisir le marche "at-the-money", c.-a-d.
             # celui dont le prix YES/NO reflete vraiment P(hausse)/P(baisse).
@@ -1065,6 +1121,9 @@ def main():
     except ImportError:
         _bc_ver = "non importe"
     log.info(f"VERSION CODE  : bot={BOT_VERSION} | btc_context={_bc_ver}")
+    log.info(f"Protections   : max_entree={MAX_ENTRY_CENTS}c | "
+             f"1 trade/marche={'OUI' if ONE_TRADE_PER_MARKET else 'NON'} | "
+             f"min_restant={BTC_MIN_MINUTES:g}min")
     log.info(f"Type marche   : {'BTC 15min (seuil 60%)' if args.btc else market_mode.upper()}")
     log.info(f"Capital       : ${args.capital:,.2f}")
     log.info(f"Stop loss/jour: ${args.max_daily_loss:,.2f}")
