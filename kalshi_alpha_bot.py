@@ -79,7 +79,7 @@ KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
-BOT_VERSION       = "v8.1-diag-2026-07-04"
+BOT_VERSION       = "v9-datafix-2026-07-04"
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
@@ -258,6 +258,14 @@ class RiskManager:
 class KalshiClient:
     def __init__(self, demo: bool = False):
         self.base_url = KALSHI_DEMO_URL if demo else KALSHI_BASE_URL
+        # FIX v9 : en mode demo, les DONNEES DE MARCHE viennent quand meme de
+        # la production. L'environnement demo-api.kalshi.co ne contient que
+        # des marches perimes (constate le 04/07/2026 : un seul marche
+        # KXBTC15M, clos depuis mai) -> le bot ne trouvait jamais de marche.
+        # Securite : les ORDRES restent inchanges. En mode demo,
+        # place_order(dry_run=True) retourne AVANT tout appel reseau,
+        # donc aucun ordre reel ne peut partir, quelle que soit l'URL.
+        self.data_url = KALSHI_BASE_URL
         self.demo     = demo
         self.session  = requests.Session()
         self._pk      = None
@@ -305,6 +313,28 @@ class KalshiClient:
         return self.session.request(
             method.upper(), self.base_url + path, headers=headers, timeout=15, **kw
         )
+
+    def _req_data(self, method: str, path: str, **kw):
+        """Requete de DONNEES DE MARCHE (lecture seule) -- toujours vers la
+        production, meme en mode demo.
+        D'apres la doc Kalshi, les endpoints de donnees de marche (/markets,
+        /events, /series) sont publics et ne requierent pas d'authentification
+        -- A VERIFIER dans la doc actuelle. On tente d'abord sans auth ;
+        si l'API repond 401/403, on retente avec la signature."""
+        url = self.data_url + path
+        try:
+            r = self.session.request(
+                method.upper(), url,
+                headers={"Content-Type": "application/json"}, timeout=15, **kw
+            )
+            if r.status_code in (401, 403):
+                log.info("[Kalshi] Endpoint de donnees exige l'auth -- nouvel essai signe.")
+                headers = self._sign_headers(method, url)
+                r = self.session.request(method.upper(), url,
+                                         headers=headers, timeout=15, **kw)
+            return r
+        except Exception:
+            raise
 
     @staticmethod
     def _normalize_market(m: dict) -> dict:
@@ -377,10 +407,8 @@ class KalshiClient:
         return m
 
     def get_market(self, ticker: str) -> dict:
-        if not KALSHI_KEY_ID:
-            return {}
         try:
-            r = self._req("GET", f"/markets/{ticker}")
+            r = self._req_data("GET", f"/markets/{ticker}")
             r.raise_for_status()
             return self._normalize_market(r.json().get("market", {}))
         except Exception as e:
@@ -388,10 +416,8 @@ class KalshiClient:
             return {}
 
     def get_active_markets(self, category: str = "economic") -> list:
-        if not KALSHI_KEY_ID:
-            return []
         try:
-            r = self._req("GET", "/markets",
+            r = self._req_data("GET", "/markets",
                           params={"status": "open", "series_ticker": category, "limit": 50})
             r.raise_for_status()
             markets = r.json().get("markets", [])
