@@ -14,7 +14,14 @@ from datetime import datetime, date
 from typing import Optional
 from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+# FIX v8.1 : dotenv ne sert qu'en developpement local (fichier .env).
+# En production (Railway), les variables viennent de l'environnement du
+# service -- son absence ne doit jamais faire planter le bot.
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 import requests
 import anthropic
 
@@ -72,7 +79,7 @@ KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
-BOT_VERSION       = "v8-diag-2026-07-04"
+BOT_VERSION       = "v8.1-diag-2026-07-04"
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
