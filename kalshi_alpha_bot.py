@@ -79,7 +79,7 @@ KALSHI_BASE_URL   = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_DEMO_URL   = "https://demo-api.kalshi.co/trade-api/v2"
 
 KALSHI_FEE_RATE   = 0.0245
-BOT_VERSION       = "v10-protections-2026-07-04"
+BOT_VERSION       = "v10.1-resolver-2026-07-05"
 MIN_EDGE          = 0.03
 MIN_CONFIDENCE    = 4
 
@@ -888,7 +888,7 @@ def run_cycle(args, kalshi: KalshiClient, engine: AlphaEngine,
                 if n_resolved > 0:
                     log.info(f"[Resolver] {n_resolved} trades resolus -> modele mis a jour.")
             except Exception as _e:
-                log.debug(f"[Resolver] Erreur: {_e}")
+                log.warning(f"[Resolver] Erreur: {_e}")
 
         manual_ticker = getattr(args, "btc_ticker", "")
 

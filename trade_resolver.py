@@ -1,329 +1,186 @@
 """
-trade_resolver.py  --  v1
-Verifie les marches BTC 15min fermes sur Kalshi et enregistre
-le resultat reel (won/lost + pnl) dans btc_trade_results.json.
+trade_resolver.py  --  v2 (2026-07-05)
+Adapte a l'architecture v10 de kalshi_alpha_bot.
 
-Ce module est la brique fondamentale de l'apprentissage :
-sans resultats reels, le modele ne peut pas apprendre.
+Role : resoudre les trades simules (DRY RUN) enregistres dans
+kalshi_trades.json en interrogeant l'API Kalshi de production
+(donnees publiques via kalshi.get_market), puis calculer le PnL
+apres frais et alimenter les statistiques de btc_context.
 
-USAGE autonome :
-    python trade_resolver.py          # resout les trades en attente
-    python trade_resolver.py --stats  # affiche les stats de performance
-
-USAGE depuis kalshi_alpha_bot.py :
-    from trade_resolver import resolve_pending_trades
-    resolve_pending_trades(kalshi_client)  # appele au debut de chaque cycle
+Interface attendue par kalshi_alpha_bot :
+    resolve_pending_trades(kalshi, **kwargs) -> int   (nb de trades resolus)
+    print_stats() -> None
 """
 
-import os
-import json
-import time
-import logging
-import argparse
+import json, os, math, time, logging
 from datetime import datetime, timezone
-from typing import Optional
 
 log = logging.getLogger("TradeResolver")
 
-TRADES_FILE         = "kalshi_trades.json"       # trades executes par le bot
-TRADE_RESULTS_FILE  = "btc_trade_results.json"   # resultats enregistres pour ML
-RESOLVED_IDS_FILE   = "resolved_trade_ids.json"  # ids deja resolus (evite doublons)
+TRADES_FILE = "kalshi_trades.json"
+
+# Frais de trading Kalshi.
+# Formule usuelle publiee : frais = 0.07 x contrats x P x (1-P), arrondis
+# au cent superieur, preleves a l'execution (gagnant ou perdant).
+# ATTENTION : bareme a VERIFIER dans le document officiel de Kalshi
+# ("fee schedule") -- il peut changer et varier selon les series.
+FEE_RATE = float(os.getenv("KALSHI_FEE_RATE_TRADING", "0.07"))
+
+# Ne tenter de resoudre un trade qu'apres ce delai (le marche 15min doit
+# avoir eu le temps de fermer ET d'etre regle par Kalshi).
+MIN_AGE_MINUTES = float(os.getenv("RESOLVER_MIN_AGE_MIN", "20"))
+
+# Nombre max de requetes API par passage (le resolveur tourne tous les
+# 5 cycles ; on evite de marteler l'API si beaucoup de trades s'accumulent).
+MAX_LOOKUPS_PER_PASS = int(os.getenv("RESOLVER_MAX_LOOKUPS", "25"))
 
 
-# ── Chargement / sauvegarde ───────────────────────────────────────────────────
+def _fees(count: int, price_cents: int) -> float:
+    p = price_cents / 100.0
+    return math.ceil(FEE_RATE * count * p * (1 - p) * 100) / 100.0
 
-def _load_json(path: str, default):
-    if not os.path.exists(path):
-        return default
+
+def _age_minutes(iso_ts: str) -> float:
+    """Age du trade en minutes. En cas de timestamp illisible, retourne
+    une valeur enorme pour ne pas bloquer la resolution indefiniment."""
     try:
-        with open(path, encoding="utf-8") as f:
+        t = datetime.fromisoformat(iso_ts)
+        if t.tzinfo is None:
+            # Les timestamps du bot sont naifs ; le conteneur tourne en UTC.
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds() / 60.0
+    except Exception:
+        return 1e9
+
+
+def _load_trades() -> list:
+    if not os.path.exists(TRADES_FILE):
+        return []
+    try:
+        with open(TRADES_FILE, encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        log.warning(f"Erreur lecture {path}: {e}")
-        return default
+        log.warning(f"[Resolver] Lecture {TRADES_FILE} impossible: {e}")
+        return []
 
-def _save_json(path: str, data):
+
+def _save_trades(trades: list):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        with open(TRADES_FILE, "w", encoding="utf-8") as f:
+            json.dump(trades, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        log.warning(f"Erreur ecriture {path}: {e}")
+        log.warning(f"[Resolver] Ecriture {TRADES_FILE} impossible: {e}")
 
 
-# ── Verifier si un marche est ferme et recuperer son resultat ─────────────────
-
-def _get_market_result(kalshi_client, ticker: str) -> Optional[dict]:
-    """
-    Interroge l'API Kalshi pour savoir si le marche est ferme
-    et quel cote a gagne (yes ou no).
-
-    Retourne :
-        {"closed": True,  "winner": "yes"|"no", "yes_price_final": int}
-        {"closed": False}
-        None si erreur reseau
-    """
-    try:
-        market = kalshi_client.get_market(ticker)
-        if not market:
-            return None
-
-        status = market.get("status", "")
-
-        # Marche encore ouvert
-        if status not in ("finalized", "resolved", "settled", "closed"):
-            return {"closed": False}
-
-        # Resultat final
-        result        = market.get("result", "")
-        yes_price_end = market.get("yes_ask", market.get("yes_bid", 50))
-
-        winner = None
-        if result in ("yes", "YES", "Yes"):
-            winner = "yes"
-        elif result in ("no", "NO", "No"):
-            winner = "no"
-        else:
-            # Essaie de deduire depuis le prix final
-            try:
-                price = int(yes_price_end)
-                winner = "yes" if price >= 90 else "no" if price <= 10 else None
-            except Exception:
-                pass
-
-        return {
-            "closed":          True,
-            "winner":          winner,
-            "yes_price_final": yes_price_end,
-            "status":          status,
-        }
-
-    except Exception as e:
-        log.debug(f"Erreur get_market_result({ticker}): {e}")
-        return None
-
-
-# ── Calcul du PnL reel ────────────────────────────────────────────────────────
-
-def _compute_pnl(trade: dict, winner: str) -> float:
-    """
-    Calcule le PnL reel en dollars d'un trade execute.
-
-    trade["side"]  : "yes" ou "no"  (cote achete)
-    trade["price"] : prix en cents paye par contrat
-    trade["count"] : nombre de contrats
-    winner         : "yes" ou "no"  (cote qui a gagne)
-
-    Kalshi : chaque contrat vaut $1 si gagne, $0 si perdu.
-    Frais : 2.45% sur les gains uniquement.
-    """
-    side  = trade.get("side",  "yes")
-    price = trade.get("price", 50)    # cents
-    count = trade.get("count", 1)
-
-    cost     = (price / 100) * count  # montant investi en dollars
-    won_trade = (side == winner)
-
-    if won_trade:
-        gross_gain = 1.0 * count               # $1 par contrat gagne
-        fee        = gross_gain * 0.0245       # frais Kalshi 2.45%
-        pnl        = gross_gain - fee - cost   # gain net
-    else:
-        pnl = -cost  # perte totale de la mise
-
-    return round(pnl, 4)
-
-
-# ── Resolution des trades en attente ─────────────────────────────────────────
-
-def resolve_pending_trades(kalshi_client, max_resolve: int = 20) -> int:
-    """
-    Parcourt les trades executes non encore resolus, interroge Kalshi,
-    et enregistre le resultat dans btc_trade_results.json.
-
-    Retourne le nombre de trades resolus ce cycle.
-    """
-    trades      = _load_json(TRADES_FILE, [])
-    resolved    = set(_load_json(RESOLVED_IDS_FILE, []))
-    results     = _load_json(TRADE_RESULTS_FILE, [])
-
-    # Filtre : trades BTC non encore resolus
-    pending = [
-        t for t in trades
-        if t.get("market_type") == "btc"
-        and t.get("ticker")
-        and _trade_id(t) not in resolved
-    ]
-
-    if not pending:
+def resolve_pending_trades(kalshi, **kwargs) -> int:
+    """Resout les trades en attente. Retourne le nombre resolu ce passage."""
+    trades = _load_trades()
+    if not trades:
         return 0
 
-    log.info(f"[Resolver] {len(pending)} trades BTC en attente de resolution.")
-    newly_resolved = 0
+    # Import tardif pour eviter tout import circulaire.
+    try:
+        from btc_context import record_trade_result
+    except ImportError:
+        def record_trade_result(*a, **k):  # noqa
+            pass
 
-    for trade in pending[:max_resolve]:
-        tid    = _trade_id(trade)
-        ticker = trade["ticker"]
+    n_resolved  = 0
+    n_lookups   = 0
+    n_unsettled = 0
+    n_noresult  = 0
+    changed     = False
 
-        market_result = _get_market_result(kalshi_client, ticker)
-        if market_result is None:
-            log.debug(f"[Resolver] {ticker}: erreur reseau, reessai plus tard.")
+    for t in trades:
+        if t.get("resolution"):
+            continue                      # deja resolu
+        ticker = t.get("ticker")
+        if not ticker:
+            continue
+        if _age_minutes(t.get("timestamp", "")) < MIN_AGE_MINUTES:
+            continue                      # marche pas encore ferme/regle
+        if n_lookups >= MAX_LOOKUPS_PER_PASS:
+            break
+
+        n_lookups += 1
+        m = kalshi.get_market(ticker)
+        if not m:
             continue
 
-        if not market_result.get("closed"):
-            log.debug(f"[Resolver] {ticker}: encore ouvert.")
+        # Champs attendus du marche regle : status ("settled"/"finalized")
+        # et result ("yes"/"no"). NOMS ET VALEURS A VERIFIER dans la doc
+        # Kalshi actuelle -- si "result" n'apparait jamais, le compteur
+        # n_noresult ci-dessous le rendra visible dans les logs.
+        result = str(m.get("result", "") or "").lower()
+        status = str(m.get("status", "") or "").lower()
+
+        if result not in ("yes", "no"):
+            if status in ("settled", "finalized", "closed"):
+                n_noresult += 1
+            else:
+                n_unsettled += 1
             continue
 
-        winner = market_result.get("winner")
-        if winner is None:
-            log.warning(f"[Resolver] {ticker}: ferme mais winner indetermine -- skip.")
-            resolved.add(tid)  # evite de reessayer indefiniment
+        side  = str(t.get("side", "")).lower()
+        count = int(t.get("count", 0))
+        price = int(t.get("price", 0))
+        if side not in ("yes", "no") or count <= 0 or not (1 <= price <= 99):
+            t["resolution"] = {"error": "donnees de trade invalides"}
+            changed = True
             continue
 
-        side     = trade.get("side", "yes")
-        won      = (side == winner)
-        pnl      = _compute_pnl(trade, winner)
-        edge     = trade.get("edge", 0)
-        verdict  = trade.get("verdict", "")
+        won  = (result == side)
+        cost = count * price / 100.0
+        fees = _fees(count, price)
+        # Gagnant : paiement 1$/contrat - cout - frais ; Perdant : -cout - frais.
+        pnl  = round((count * (100 - price) / 100.0) - fees, 2) if won \
+               else round(-(cost + fees), 2)
 
-        # Enregistre dans btc_trade_results.json pour la calibration ML
-        results.append({
-            "timestamp":  time.time(),
-            "trade_time": trade.get("timestamp", ""),
-            "ticker":     ticker,
-            "verdict":    verdict,
-            "side":       side,
-            "winner":     winner,
-            "won":        won,
-            "pnl":        pnl,
-            "edge":       edge,
-            "price":      trade.get("price", 50),
-            "count":      trade.get("count", 1),
-        })
+        t["resolution"] = {
+            "result":      result,
+            "won":         won,
+            "pnl":         pnl,
+            "fees":        round(fees, 2),
+            "resolved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        changed = True
+        n_resolved += 1
 
-        resolved.add(tid)
-        newly_resolved += 1
+        try:
+            record_trade_result(verdict=t.get("verdict", ""),
+                                edge=float(t.get("edge", 0) or 0),
+                                won=won, pnl=pnl)
+        except Exception as e:
+            log.warning(f"[Resolver] record_trade_result: {e}")
 
-        status_str = "GAGNE" if won else "PERDU"
-        log.info(
-            f"[Resolver] {ticker} -> {status_str} | "
-            f"side={side} winner={winner} | pnl=${pnl:+.2f} | edge={edge:.1%}"
-        )
+        log.info(f"[Resolver] {ticker} -> {result.upper()} | "
+                 f"{'GAGNE' if won else 'PERDU'} | PnL={pnl:+.2f}$ "
+                 f"(frais={fees:.2f}$)")
 
-    # Sauvegarde
-    if newly_resolved > 0:
-        if len(results) > 500:
-            results = results[-500:]
-        _save_json(TRADE_RESULTS_FILE, results)
-        _save_json(RESOLVED_IDS_FILE, list(resolved))
-        log.info(f"[Resolver] {newly_resolved} trades resolus et enregistres.")
-
-    return newly_resolved
-
-
-def _trade_id(trade: dict) -> str:
-    """Identifiant unique d'un trade (ticker + timestamp)."""
-    return f"{trade.get('ticker','')}_{trade.get('timestamp','')}"
-
-
-# ── Statistiques de performance ───────────────────────────────────────────────
-
-def get_full_stats() -> dict:
-    """Retourne des statistiques detaillees sur les trades resolus."""
-    results = _load_json(TRADE_RESULTS_FILE, [])
-    if not results:
-        return {"total": 0, "message": "Aucun trade resolu."}
-
-    total     = len(results)
-    wins      = [r for r in results if r.get("won")]
-    losses    = [r for r in results if not r.get("won")]
-    win_rate  = len(wins) / total
-    total_pnl = sum(r.get("pnl", 0) for r in results)
-
-    # Stats par tranche d'edge
-    edge_buckets = {"0-5%": [], "5-10%": [], "10%+": []}
-    for r in results:
-        e = abs(r.get("edge", 0))
-        if e < 0.05:
-            edge_buckets["0-5%"].append(r)
-        elif e < 0.10:
-            edge_buckets["5-10%"].append(r)
-        else:
-            edge_buckets["10%+"].append(r)
-
-    edge_stats = {}
-    for bucket, trades in edge_buckets.items():
-        if trades:
-            wr = sum(1 for t in trades if t.get("won")) / len(trades)
-            pnl = sum(t.get("pnl", 0) for t in trades)
-            edge_stats[bucket] = {"trades": len(trades), "win_rate": wr, "pnl": pnl}
-
-    # Stats par cote (YES vs NO)
-    yes_trades = [r for r in results if r.get("side") == "yes"]
-    no_trades  = [r for r in results if r.get("side") == "no"]
-    yes_wr = sum(1 for t in yes_trades if t.get("won")) / len(yes_trades) if yes_trades else 0
-    no_wr  = sum(1 for t in no_trades  if t.get("won")) / len(no_trades)  if no_trades  else 0
-
-    # 7 derniers jours
-    now_ts = time.time()
-    recent_7d = [r for r in results if now_ts - r.get("timestamp", 0) < 7 * 86400]
-    wr_7d     = sum(1 for r in recent_7d if r.get("won")) / len(recent_7d) if recent_7d else 0
-    pnl_7d    = sum(r.get("pnl", 0) for r in recent_7d)
-
-    return {
-        "total":       total,
-        "win_rate":    win_rate,
-        "total_pnl":   total_pnl,
-        "wins":        len(wins),
-        "losses":      len(losses),
-        "edge_stats":  edge_stats,
-        "yes_win_rate": yes_wr,
-        "no_win_rate":  no_wr,
-        "yes_trades":   len(yes_trades),
-        "no_trades":    len(no_trades),
-        "win_rate_7d":  wr_7d,
-        "pnl_7d":       pnl_7d,
-        "trades_7d":    len(recent_7d),
-    }
+    if n_noresult:
+        log.warning(f"[Resolver] {n_noresult} marche(s) fermes sans champ "
+                    f"'result' exploitable -- verifier le nom du champ dans "
+                    f"la reponse API Kalshi.")
+    if changed:
+        _save_trades(trades)
+    return n_resolved
 
 
 def print_stats():
-    s = get_full_stats()
-    if s.get("total", 0) == 0:
-        print("Aucun trade resolu pour le moment.")
+    """Affiche un bilan des trades resolus (appele par le bot ou a la main)."""
+    trades   = _load_trades()
+    resolved = [t for t in trades if t.get("resolution", {}).get("result")]
+    pending  = [t for t in trades if not t.get("resolution")]
+    if not trades:
+        print("[Resolver] Aucun trade enregistre.")
         return
-    sep = "=" * 55
+    wins  = [t for t in resolved if t["resolution"].get("won")]
+    pnl   = sum(t["resolution"].get("pnl", 0) for t in resolved)
+    fees  = sum(t["resolution"].get("fees", 0) for t in resolved)
+    wr    = len(wins) / len(resolved) if resolved else 0.0
     print(f"""
-{sep}
-  PERFORMANCE BTC KALSHI ALPHA BOT
-{sep}
-  Total trades resolus : {s['total']}
-  Win rate global      : {s['win_rate']:.1%}
-  PnL total            : ${s['total_pnl']:+.2f}
-{sep}
-  YES : {s['yes_trades']} trades | WR {s['yes_win_rate']:.1%}
-  NO  : {s['no_trades']} trades | WR {s['no_win_rate']:.1%}
-{sep}
-  7 derniers jours : {s['trades_7d']} trades | WR {s['win_rate_7d']:.1%} | PnL ${s['pnl_7d']:+.2f}
-{sep}
-  Par tranche d'edge :""")
-    for bucket, st in s.get("edge_stats", {}).items():
-        print(f"    {bucket:8s} : {st['trades']:3d} trades | WR {st['win_rate']:.1%} | PnL ${st['pnl']:+.2f}")
-    print(sep)
-
-
-# ── Main (usage standalone) ───────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s  %(levelname)-8s  %(message)s")
-
-    parser = argparse.ArgumentParser(description="Trade Resolver -- BTC Kalshi")
-    parser.add_argument("--stats", action="store_true", help="Affiche les stats de performance")
-    args = parser.parse_args()
-
-    if args.stats:
-        print_stats()
-    else:
-        # Resolution standalone -- necessite un KalshiClient
-        print("Usage: python trade_resolver.py --stats")
-        print("Pour resoudre les trades, il est appele automatiquement par kalshi_alpha_bot.py")
+==================== BILAN TRADES ====================
+  Enregistres : {len(trades)}   Resolus : {len(resolved)}   En attente : {len(pending)}
+  Win rate    : {wr:.1%}  ({len(wins)} gagnes / {len(resolved) - len(wins)} perdus)
+  PnL net     : {pnl:+.2f}$   (dont frais : -{fees:.2f}$)
+======================================================""")
