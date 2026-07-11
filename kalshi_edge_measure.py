@@ -330,7 +330,7 @@ def _main():
         # appelant resolve_pending(kalshi.get_market).
         try:
             from kalshi_alpha_bot import KalshiClient
-            kc = KalshiClient(demo=False)   # lecture seule : get_market uniquement
+            kc = KalshiClient("prod")   # lecture seule : get_market uniquement (donnees publiques)
             summary = resolve_pending(kc.get_market, args.file)
             print(summary)
         except Exception as e:
