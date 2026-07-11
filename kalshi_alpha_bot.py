@@ -1156,6 +1156,10 @@ def main():
     ap.add_argument("--demo", action="store_true",
                     help="environnement Kalshi DEMO (ordres reels sur demo-api)")
     ap.add_argument("--loop", action="store_true")
+    ap.add_argument("--scan-only", action="store_true",
+                    help="scanner d'univers de marches: authentifie, scanne, "
+                         "ecrit market_universe.json + market_scanner_report.json, "
+                         "NE PASSE AUCUN ORDRE, puis quitte (code 0)")
     ap.add_argument("--interval", type=int, default=60)
     ap.add_argument("--capital", type=float, default=_env_f("CAPITAL", 500.0))
     args = ap.parse_args()
@@ -1169,6 +1173,18 @@ def main():
 
     client = KalshiClient(env)
     banner(client, args.capital)
+
+    if args.scan_only:
+        # Mode scanner : jamais d'ExecutionEngine, donc aucun chemin vers
+        # create_order. Ecrit les rapports et sort proprement.
+        from market_scanner import run_scan
+        res = run_scan(client)
+        rep = res["report"]
+        log.info(f"SCAN TERMINE: {rep['total_markets_received']} marches "
+                 f"({rep['api_pages']} pages) | valides={rep['valid_markets']} "
+                 f"| exclusions={rep['excluded_by_reason']}")
+        sys.exit(0)
+
     if not BTC_AVAILABLE:
         log.error("btc_context.py manquant -- arret."); sys.exit(1)
 
