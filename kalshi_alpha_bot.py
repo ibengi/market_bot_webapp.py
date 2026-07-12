@@ -1436,7 +1436,30 @@ class ExecutionEngine:
                 break
             placed += self._execute_decision(dec, report)
         report["fills_confirmed"] = placed
+        report["orders"] = report.get("orders_submitted", 0)
+        funnel = {k: report.get(k, 0) for k in
+                  ("scanned", "valid", "eligible", "strategy_supported",
+                   "model_probability", "positive_edge", "positive_net_ev",
+                   "risk_passed", "accepted", "orders")}
+        import json as _json
+        log.info(f"[STATS] {_json.dumps(funnel, ensure_ascii=False)}")
+        log.info(f"[STATS] {_json.dumps({'reject_reasons': report['rejections']}, ensure_ascii=False)}")
         JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
+        JsonStore.save(_p("pipeline_stats.json"), {
+            "cycle": n,
+            "scanned": report["scanned"],
+            "valid": report.get("scanner_included"),
+            "eligible": report["ranker_eligible"],
+            "strategy_supported": report.get("strategy_supported"),
+            "model_probability": report.get("model_probability"),
+            "positive_edge": report.get("positive_edge"),
+            "positive_net_ev": report.get("positive_net_ev"),
+            "risk_passed": report.get("risk_passed", 0),
+            "accepted": report["accepted"],
+            "orders": report.get("orders_submitted", 0),
+        })
+        JsonStore.save(_p("reject_reasons.json"),
+                       {"cycle": n, "reject_reasons": report["rejections"]})
         log.info(f"[CYCLE-REPORT] scanned={report['scanned']} "
                  f"eligibles={report['ranker_eligible']} acceptes={report['accepted']} "
                  f"ordres={report['orders_submitted']} fills={placed} "
@@ -1474,9 +1497,13 @@ class ExecutionEngine:
             self.capital, entry, dec.taille, dec.confidence,
             self.risk.rolling_drawdown(), self.posmgr.open_risk())
         if count <= 0:
+            log_rsk.info(f"[REJECT] {ticker}: risk_blocked (taille=0)")
             report["rejections"]["risk_blocked"] = \
                 report["rejections"].get("risk_blocked", 0) + 1
             return 0
+        report["risk_passed"] = report.get("risk_passed", 0) + 1
+        log_rsk.info(f"[RISK] {ticker}: portes de risque PASSEES "
+                     f"(taille={count}, capital={self.capital:.2f}$)")
 
         est_fee_total = FeeModel.trading_fee(count, entry)
         log_trd.info(f"[SIGNAL VALIDE] {ticker} {dec.side.upper()} x{count} "
@@ -1493,6 +1520,8 @@ class ExecutionEngine:
             return 0
 
         report["orders_submitted"] = report.get("orders_submitted", 0) + 1
+        log_trd.info(f"[EXECUTION] {ticker} {dec.side.upper()} x{count} "
+                     f"@ {entry}c -> envoi de l'ordre")
         exec_res = self.orders.place_and_track(ticker, dec.side, count, entry)
         if exec_res.filled <= 0:
             log_trd.warning(f"NON EXECUTE ({exec_res.state}: {exec_res.status}) "

@@ -63,12 +63,22 @@ class MarketOpportunityPipeline:
         # par run_scan a l'interieur — on les reconstruit via raw si absent.
         for s in ranking.get("snapshots", []):
             snaps_by_ticker[s.ticker] = s
+        log.info(f"[PIPELINE] snapshots recus du ranker: {len(snaps_by_ticker)} "
+                 f"| scores: {len(scores)} | eligibles: {rep_rank['eligible']}")
+        if rep_rank["eligible"] > 0 and not snaps_by_ticker:
+            log.error("[PIPELINE] DESYNCHRONISATION ranker/pipeline: aucun "
+                      "snapshot recu (market_ranker.run_ranking ne renvoie pas "
+                      "'snapshots' -- version de fichier probablement ancienne). "
+                      "TOUS les eligibles seront comptes snapshot_missing.")
 
         rejections = {}
         accepted = []
         examined = 0
         supported = 0
         positive_edge = 0
+        with_model_prob = 0
+        positive_net_ev = 0
+        self.last_traces = []
 
         eligible = [q for q in scores if q.eligible]
         for q in eligible:
@@ -76,9 +86,15 @@ class MarketOpportunityPipeline:
                 break
             snap = snaps_by_ticker.get(q.ticker)
             if snap is None:
+                rejections["snapshot_missing"] = \
+                    rejections.get("snapshot_missing", 0) + 1
+                log.info(f"[REJECT] {q.ticker}: snapshot_missing "
+                         f"(desynchronisation ranker/pipeline)")
                 continue
             snap.quality = q                       # visible pour les portes
             examined += 1
+            log.info(f"[RANK] {q.ticker} | cat={q.category} "
+                     f"| score={q.total_score}")
 
             if skip_ticker_fn and skip_ticker_fn(q.ticker):
                 rejections["already_open"] = rejections.get("already_open", 0) + 1
@@ -93,6 +109,35 @@ class MarketOpportunityPipeline:
 
             dec = evaluate_candidate(snap, fresh_market or {}, book,
                                      self.router, self.gates)
+            log.info(f"[ROUTER] {q.ticker} -> strategie="
+                     f"{dec.strategy or 'AUCUNE'}")
+            if dec.model_probability is not None:
+                log.info(f"[MODEL] {q.ticker} p_modele="
+                         f"{dec.model_probability:.4f} conf={dec.confidence}")
+            if dec.gross_edge is not None:
+                def _f(v):     # tolerant: net/ev absents si rejet en amont
+                    return f"{v:+.4f}" if isinstance(v, (int, float)) else "n/a"
+                log.info(f"[EDGE] {q.ticker} p_marche="
+                         f"{dec.market_probability:.4f} "
+                         f"brut={_f(dec.gross_edge)} "
+                         f"frais={dec.estimated_fees} slip={dec.expected_slippage} "
+                         f"net={_f(dec.net_edge)} ev={_f(dec.net_ev)}")
+            log.info(f"[{'EXECUTION-CANDIDAT' if dec.accepted else 'REJECT'}] "
+                     f"{q.ticker}"
+                     f"{'' if dec.accepted else ': ' + str(dec.rejection_reason)}")
+            self.last_traces.append({
+                "ticker": q.ticker, "ranker_score": q.total_score,
+                "category": q.category,
+                "strategy": dec.strategy,
+                "model_probability": dec.model_probability,
+                "confidence": dec.confidence,
+                "market_probability": dec.market_probability,
+                "gross_edge": dec.gross_edge,
+                "estimated_fees": dec.estimated_fees,
+                "slippage": dec.expected_slippage,
+                "net_edge": dec.net_edge, "net_ev": dec.net_ev,
+                "decision": "ACCEPT" if dec.accepted else "REJECT",
+                "reject_reason": dec.rejection_reason})
             if self.observer:
                 try:
                     self.observer(snap, book, dec)
@@ -100,8 +145,12 @@ class MarketOpportunityPipeline:
                     log.warning(f"observer: {e}")
             if dec.strategy:
                 supported += 1
+            if dec.model_probability is not None:
+                with_model_prob += 1
             if dec.gross_edge is not None and dec.gross_edge > 0:
                 positive_edge += 1
+            if dec.net_ev is not None and dec.net_ev > 0:
+                positive_net_ev += 1
             if dec.accepted:
                 accepted.append(dec)
                 log.info(f"[PIPELINE] CANDIDAT VALIDE {dec.ticker} "
@@ -111,7 +160,6 @@ class MarketOpportunityPipeline:
             else:
                 rejections[dec.rejection_reason] = \
                     rejections.get(dec.rejection_reason, 0) + 1
-                log.info(f"[PIPELINE] rejet {dec.ticker}: {dec.rejection_reason}")
 
         # les non-eligibles du ranker comptent aussi dans les rejets
         for q in scores:
@@ -128,15 +176,29 @@ class MarketOpportunityPipeline:
                                                "closes_too_soon", "invalid_book",
                                                "spread_too_wide", "low_volume",
                                                "unsupported")),
+            "valid": None,   # renseigne ci-dessous (= inclus par le scanner)
             "ranker_eligible": rep_rank["eligible"],
+            "eligible": rep_rank["eligible"],
             "candidates_examined": examined,
             "strategy_supported": supported,
+            "model_probability": with_model_prob,
             "positive_edge": positive_edge,
+            "positive_net_ev": positive_net_ev,
+            "risk_passed": 0,            # complete par le moteur
             "accepted": len(accepted),
             "orders_submitted": 0,       # complete par le moteur
+            "orders": 0,                 # alias, complete par le moteur
             "fills_confirmed": 0,        # complete par le moteur
             "rejections": rejections,
         }
+        report["valid"] = report["scanner_included"]
+        if self.save_artifacts:
+            top = sorted(self.last_traces,
+                         key=lambda r: r["ranker_score"], reverse=True)[:20]
+            from market_scanner import _save_json
+            _save_json("candidate_trace.json",
+                       {"generated": report.get("scanned"), "top20": top,
+                        "all_examined": len(self.last_traces)})
         return {"accepted": accepted, "report": report}
 
     @staticmethod
