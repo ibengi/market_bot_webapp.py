@@ -1,0 +1,173 @@
+{
+ "model_version": "btc15m-baseline-0.1+cal",
+ "generated": "2026-07-12T03:52:39+00:00",
+ "split": {
+  "train": 240,
+  "validation": 80,
+  "test": 80,
+  "chronological": true
+ },
+ "gates": {
+  "MIN_GROSS_EDGE": 0.05,
+  "MIN_NET_EDGE": 0.03,
+  "MIN_NET_EV": 0.02,
+  "MAX_SPREAD": 4
+ },
+ "n_predictions_test": 80,
+ "n_theoretical_trades": 60,
+ "win_rate": 0.8,
+ "gross_pnl": 17.4,
+ "fees": 1.2,
+ "net_pnl": 15.6,
+ "roi": 0.5098,
+ "max_drawdown": 1.16,
+ "brier_test": 0.171793,
+ "brier_market_baseline": 0.2509,
+ "log_loss_test": 0.557579,
+ "calibration_test": {
+  "label": "test",
+  "n": 80,
+  "brier": 0.171793,
+  "log_loss": 0.557579,
+  "ece": 0.049556,
+  "calibration_curve": [
+   {
+    "bin": "0.0-0.1",
+    "p_moyenne": null,
+    "taux_reel": null,
+    "n": 0
+   },
+   {
+    "bin": "0.1-0.2",
+    "p_moyenne": 0.1575,
+    "taux_reel": 0.0952,
+    "n": 21
+   },
+   {
+    "bin": "0.2-0.3",
+    "p_moyenne": null,
+    "taux_reel": null,
+    "n": 0
+   },
+   {
+    "bin": "0.3-0.4",
+    "p_moyenne": 0.3,
+    "taux_reel": 0.3333,
+    "n": 9
+   },
+   {
+    "bin": "0.4-0.5",
+    "p_moyenne": null,
+    "taux_reel": null,
+    "n": 0
+   },
+   {
+    "bin": "0.5-0.6",
+    "p_moyenne": 0.52,
+    "taux_reel": 0.55,
+    "n": 20
+   },
+   {
+    "bin": "0.6-0.7",
+    "p_moyenne": null,
+    "taux_reel": null,
+    "n": 0
+   },
+   {
+    "bin": "0.7-0.8",
+    "p_moyenne": 0.7246,
+    "taux_reel": 0.6842,
+    "n": 19
+   },
+   {
+    "bin": "0.8-0.9",
+    "p_moyenne": null,
+    "taux_reel": null,
+    "n": 0
+   },
+   {
+    "bin": "0.9-1.0",
+    "p_moyenne": 0.999,
+    "taux_reel": 0.9091,
+    "n": 11
+   }
+  ],
+  "generated": "2026-07-12T03:52:39+00:00"
+ },
+ "calibration_fitted_on": "train uniquement",
+ "by_hour": {
+  "00-07": {
+   "n": 14,
+   "win_rate": 0.8571,
+   "net_pnl": 4.46
+  },
+  "08-15": {
+   "n": 25,
+   "win_rate": 0.8,
+   "net_pnl": 6.53
+  },
+  "16-23": {
+   "n": 21,
+   "win_rate": 0.7619,
+   "net_pnl": 4.61
+  }
+ },
+ "by_volatility": {
+  "basse<5e-4": {
+   "n": 0,
+   "win_rate": null,
+   "net_pnl": 0
+  },
+  "moyenne": {
+   "n": 60,
+   "win_rate": 0.8,
+   "net_pnl": 15.6
+  },
+  "haute>=15e-4": {
+   "n": 0,
+   "win_rate": null,
+   "net_pnl": 0
+  }
+ },
+ "by_time_remaining": {
+  "0-5": {
+   "n": 13,
+   "win_rate": 0.7692,
+   "net_pnl": 3.01
+  },
+  "5-10": {
+   "n": 22,
+   "win_rate": 0.6818,
+   "net_pnl": 3.1
+  },
+  "10-15+": {
+   "n": 25,
+   "win_rate": 0.92,
+   "net_pnl": 9.49
+  }
+ },
+ "by_net_edge": {
+  "0-3%": {
+   "n": 0,
+   "win_rate": null,
+   "net_pnl": 0
+  },
+  "3-5%": {
+   "n": 0,
+   "win_rate": null,
+   "net_pnl": 0
+  },
+  "5-8%": {
+   "n": 0,
+   "win_rate": null,
+   "net_pnl": 0
+  },
+  "8%+": {
+   "n": 60,
+   "win_rate": 0.8,
+   "net_pnl": 15.6
+  }
+ },
+ "DATA_SOURCE": "FIXTURE SYNTHETIQUE deterministe (test_model_research._dataset) -- NE VALIDE PAS le modele sur donnees reelles",
+ "model_hash": "e3276e91473c52a068a59eb51d1afe660b027397480699d3fddb0bc7343ac24b"
+}

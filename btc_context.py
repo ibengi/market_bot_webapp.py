@@ -1,263 +1,262 @@
 """
-btc_context.py  --  v6 SIMPLE
-Logique : si le marche dit YES >= 60c -> achete YES
-          si le marche dit NO  >= 60c -> achete NO
-          sinon -> aucun trade
+btc_context.py — v2 (2026-07-12)
+Acquisition et normalisation des donnees BTC pour le modele 15 minutes.
 
-Pas de modele, pas de Black-Scholes.
-On suit le prix de marche directement.
+CE MODULE NE PREND AUCUNE DECISION DE TRADING. Il retourne un objet
+structure (BtcMarketContext) decrivant l'etat du marche et la QUALITE des
+donnees. Si moins de deux sources spot valides sont disponibles, le contexte
+est invalide et AUCUNE probabilite ne pourra etre calculee en aval.
+
+Sources par defaut (publiques, sans cle) : Coinbase, Kraken, Bitstamp pour
+le spot ; Binance pour les bougies 1 minute. Toutes les sources sont
+INJECTABLES pour les tests hors-ligne (aucun test ne touche le reseau).
+
+Aucun secret dans ce fichier.
 """
 
-import time, json, os, logging, statistics
-from typing import Optional
-import requests
+import math
+import time
+import logging
+import statistics
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Callable
 
-log = logging.getLogger("BTCContext")
+log = logging.getLogger("BTCCTX")
 
-VERSION = "v7-fix-2026-07-02"
+# ── Parametres (env-surchargables cote appelant si besoin) ───────────────────
+HTTP_TIMEOUT_S      = 5.0
+MAX_RETRIES         = 1            # retry LIMITE par source
+CACHE_TTL_S         = 10.0         # cache court : donnees "ultra fraiches"
+MAX_PRICE_AGE_S     = 90.0         # au-dela : donnee PERIMEE
+MAX_DISPERSION_PCT  = 0.5          # ecart max entre exchanges (aberrant sinon)
+MIN_VALID_SOURCES   = 2
+MIN_KLINES          = 11           # pour rendement 10m + vol realisee
 
-PRICE_HISTORY_FILE = "btc_price_history.json"
-TRADE_RESULTS_FILE = "btc_trade_results.json"
-
-_price_history  = []
-_history_loaded = False
-
-THRESHOLD = 60  # cents -- seuil de decision
+_cache = {}                        # key -> (value, ts)
 
 
-# ── Persistance prix (pour les stats) ────────────────────────────────────────
-
-def _load_price_history():
-    global _price_history, _history_loaded
-    if _history_loaded:
-        return
-    _history_loaded = True
-    if not os.path.exists(PRICE_HISTORY_FILE):
-        return
-    try:
-        with open(PRICE_HISTORY_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        cutoff = time.time() - 240 * 60
-        _price_history = [(t, p) for t, p in data if t >= cutoff]
-    except Exception:
-        pass
-
-def _save_price_history():
-    try:
-        with open(PRICE_HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(_price_history, f)
-    except Exception:
-        pass
-
-def _record_price(price: float):
-    _load_price_history()
+def _cached(key, ttl, fn):
     now = time.time()
-    _price_history.append((now, price))
-    cutoff = now - 240 * 60
-    while _price_history and _price_history[0][0] < cutoff:
-        _price_history.pop(0)
-    if len(_price_history) % 5 == 0:
-        _save_price_history()
+    if key in _cache:
+        val, ts = _cache[key]
+        if now - ts < ttl:
+            return val
+    val = fn()
+    if val is not None:
+        _cache[key] = (val, now)
+    return val
 
 
-# ── Resultats trades ──────────────────────────────────────────────────────────
+# ── Fetchers par defaut (reseau) — remplacables par injection ────────────────
 
-def record_trade_result(verdict: str, edge: float, won: bool, pnl: float = 0.0):
-    history = _load_trade_results()
-    history.append({"timestamp": time.time(), "verdict": verdict,
-                     "edge": edge, "won": won, "pnl": pnl})
-    if len(history) > 500:
-        history = history[-500:]
+def _http_get_json(url, params=None):
+    import requests
+    last = None
+    for _ in range(1 + MAX_RETRIES):
+        try:
+            r = requests.get(url, params=params, timeout=HTTP_TIMEOUT_S)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:            # noqa: BLE001 — retry limite
+            last = e
+    log.debug(f"source {url}: {last}")
+    return None
+
+
+def fetch_coinbase() -> Optional[dict]:
+    d = _http_get_json("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+    if not d:
+        return None
     try:
-        with open(TRADE_RESULTS_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, indent=2)
-    except Exception:
-        pass
-
-def _load_trade_results() -> list:
-    if not os.path.exists(TRADE_RESULTS_FILE):
-        return []
-    try:
-        with open(TRADE_RESULTS_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-def get_performance_stats() -> dict:
-    history = _load_trade_results()
-    if not history:
-        return {"total": 0, "win_rate": 0.0, "total_pnl": 0.0,
-                "yes_trades": 0, "no_trades": 0, "yes_wr": 0.0, "no_wr": 0.0}
-    total     = len(history)
-    wins      = sum(1 for t in history if t.get("won"))
-    total_pnl = sum(t.get("pnl", 0) for t in history)
-    yes_t = [t for t in history if "YES" in t.get("verdict", "")]
-    no_t  = [t for t in history if "NO"  in t.get("verdict", "")]
-    return {
-        "total":      total,
-        "win_rate":   wins / total,
-        "total_pnl":  total_pnl,
-        "yes_trades": len(yes_t),
-        "no_trades":  len(no_t),
-        "yes_wr":     sum(1 for t in yes_t if t.get("won")) / len(yes_t) if yes_t else 0,
-        "no_wr":      sum(1 for t in no_t  if t.get("won")) / len(no_t)  if no_t  else 0,
-    }
-
-
-# ── Prix BTC (pour le log) ────────────────────────────────────────────────────
-
-def _fetch_coinbase() -> Optional[float]:
-    try:
-        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=3)
-        r.raise_for_status()
-        return float(r.json()["data"]["amount"])
-    except Exception:
+        return {"source": "coinbase", "price": float(d["data"]["amount"]),
+                "ts": time.time()}
+    except (KeyError, TypeError, ValueError):
         return None
 
-def _fetch_kraken() -> Optional[float]:
+
+def fetch_kraken() -> Optional[dict]:
+    d = _http_get_json("https://api.kraken.com/0/public/Ticker",
+                       {"pair": "XBTUSD"})
     try:
-        r = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=3)
-        r.raise_for_status()
-        d = r.json()["result"]
-        return float(d[list(d.keys())[0]]["c"][0])
-    except Exception:
+        return {"source": "kraken",
+                "price": float(d["result"]["XXBTZUSD"]["c"][0]),
+                "ts": time.time()}
+    except (KeyError, TypeError, ValueError, AttributeError):
         return None
 
-def get_btc_price() -> Optional[float]:
-    _load_price_history()
-    prices = [p for p in [_fetch_coinbase(), _fetch_kraken()] if p]
-    if not prices:
+
+def fetch_bitstamp() -> Optional[dict]:
+    d = _http_get_json("https://www.bitstamp.net/api/v2/ticker/btcusd/")
+    try:
+        # bitstamp fournit son propre timestamp -> validation de fraicheur
+        return {"source": "bitstamp", "price": float(d["last"]),
+                "ts": float(d.get("timestamp", time.time()))}
+    except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    price = sum(prices) / len(prices)
-    log.info(f"BTC price ({len(prices)} exchanges): ${price:,.2f}")
-    return round(price, 2)
-
-def get_btc_context(target_price: float = 0, minutes: int = 15) -> str:
-    price = get_btc_price()
-    stats = get_performance_stats()
-    # FIX : si Coinbase ET Kraken echouent, price vaut None et
-    # f"${price:,.2f}" levait un TypeError qui faisait planter le cycle.
-    price_txt = f"${price:,.2f}" if price is not None else "indisponible"
-    return (
-        f"Prix BTC: {price_txt} | Seuil decision: {THRESHOLD}c\n"
-        f"Trades: {stats['total']} | WR: {stats['win_rate']:.1%} | PnL: ${stats['total_pnl']:.2f}\n"
-        f"YES: {stats['yes_trades']} trades WR={stats['yes_wr']:.1%} | "
-        f"NO: {stats['no_trades']} trades WR={stats['no_wr']:.1%}"
-    )
 
 
-# ── DECISION PRINCIPALE -- LOGIQUE SIMPLE ────────────────────────────────────
+def fetch_klines_binance(limit: int = 30) -> Optional[list]:
+    d = _http_get_json("https://api.binance.com/api/v3/klines",
+                       {"symbol": "BTCUSDT", "interval": "1m", "limit": limit})
+    if not d:
+        return None
+    try:
+        return [{"ts": k[0] / 1000.0, "open": float(k[1]), "high": float(k[2]),
+                 "low": float(k[3]), "close": float(k[4]),
+                 "volume": float(k[5])} for k in d]
+    except (TypeError, ValueError, IndexError):
+        return None
 
-def evaluate_btc_trade(
-    strike_price: float,
-    market_yes_price_cents: int,
-    minutes_remaining: float,
-    min_edge: float = 0.04,           # garde pour compatibilite mais non utilise
-    min_history_points: int = 1,      # reduit a 1 car on n'a plus besoin d'historique
-    market_no_price_cents: int = None,
-) -> dict:
-    """
-    Logique v6 ULTRA-SIMPLE :
 
-    yes_price >= 60c  ->  ACHETER YES
-    no_price  >= 60c  ->  ACHETER NO
-    sinon             ->  AUCUN TRADE
+DEFAULT_SPOT_SOURCES = (fetch_coinbase, fetch_kraken, fetch_bitstamp)
 
-    On suit le prix de marche directement, sans modele mathematique.
-    Le marche Kalshi encode deja l'opinion collective des traders.
-    Si 60% des traders pensent que le BTC va monter -> on achete YES.
-    Si 60% pensent qu'il va baisser             -> on achete NO.
-    """
-    price = get_btc_price()
-    if price:
-        _record_price(price)
-    # FIX : si les deux APIs de prix echouent, price est None et les
-    # f-strings "${price:,.0f}" plus bas levaient un TypeError -> crash du
-    # cycle complet. On formate le prix une seule fois, de facon sure.
-    price_txt = f"${price:,.0f}" if price is not None else "N/A"
 
-    yes_cents = int(market_yes_price_cents)
-    no_cents  = int(market_no_price_cents) if market_no_price_cents is not None \
-                else (100 - yes_cents)
+# ── Objet retourne ───────────────────────────────────────────────────────────
 
-    # Garde-fou : yes + no doit valoir ~100c. Un gros ecart signale des
-    # donnees de carnet incoherentes -> on ne trade pas dessus.
-    if abs((yes_cents + no_cents) - 100) > 15:
-        log.warning(f"[BTC] Carnet incoherent: yes={yes_cents}c + no={no_cents}c "
-                    f"!= 100c -- AUCUN TRADE ce cycle.")
-        yes_cents = no_cents = 50  # force le verdict AUCUN TRADE plus bas
+@dataclass
+class BtcMarketContext:
+    valid: bool
+    reason: str
+    generated_ts: float
+    spot: Optional[float] = None            # consensus (mediane des sources)
+    sources: list = field(default_factory=list)   # [{source, price, ts}]
+    n_valid_sources: int = 0
+    dispersion_pct: Optional[float] = None  # (max-min)/mediane * 100
+    strike: Optional[float] = None
+    distance: Optional[float] = None        # spot - strike ($)
+    distance_norm: Optional[float] = None   # ln(spot/strike)
+    minutes_remaining: Optional[float] = None
+    returns: dict = field(default_factory=dict)   # {"1m","3m","5m","10m"} log
+    realized_vol_1m: Optional[float] = None # ecart-type des log-rendements 1m
+    momentum_per_min: Optional[float] = None
+    klines_count: int = 0
+    data_quality_score: float = 0.0         # 0..100
+    quality_flags: list = field(default_factory=list)
 
-    log.info(
-        f"[BTC Simple] yes={yes_cents}c no={no_cents}c "
-        f"strike=${strike_price:,.2f} t={minutes_remaining:.1f}min | "
-        f"seuil={THRESHOLD}c dans les deux sens"
-    )
+    def to_dict(self):
+        return asdict(self)
 
-    # ── Decision ─────────────────────────────────────────────────────────────
-    if yes_cents >= THRESHOLD:
-        verdict    = "ACHETER YES"
-        prob_r     = yes_cents / 100.0
-        prob_m     = yes_cents / 100.0
-        edge       = 0.0   # on suit le marche, pas d'edge calcule
-        raison     = (f"YES a {yes_cents}c >= seuil {THRESHOLD}c "
-                      f"-> marche faveur UP | BTC={price_txt} strike=${strike_price:,.0f}")
 
-    elif no_cents >= THRESHOLD:
-        verdict    = "ACHETER NO"
-        prob_r     = no_cents / 100.0
-        prob_m     = no_cents / 100.0
-        edge       = 0.0
-        raison     = (f"NO a {no_cents}c >= seuil {THRESHOLD}c "
-                      f"-> marche faveur DOWN | BTC={price_txt} strike=${strike_price:,.0f}")
+# ── Validation des sources spot ──────────────────────────────────────────────
 
+def _validate_sources(raw: list, now: float) -> (list, list):
+    """Filtre : prix positifs, timestamps frais, aberrants exclus (ecart a
+    la mediane > MAX_DISPERSION_PCT)."""
+    flags = []
+    fresh = []
+    for s in raw:
+        if not s or not isinstance(s.get("price"), (int, float)):
+            continue
+        if s["price"] <= 0 or math.isnan(s["price"]) or math.isinf(s["price"]):
+            flags.append(f"{s.get('source','?')}:prix_invalide")
+            continue
+        age = now - float(s.get("ts", 0))
+        if age > MAX_PRICE_AGE_S or age < -30:
+            flags.append(f"{s.get('source','?')}:perime({age:.0f}s)")
+            continue
+        fresh.append(s)
+    if len(fresh) >= 2:
+        med = statistics.median(x["price"] for x in fresh)
+        kept = []
+        for s in fresh:
+            dev = abs(s["price"] - med) / med * 100
+            if dev > MAX_DISPERSION_PCT:
+                flags.append(f"{s['source']}:aberrant({dev:.2f}%)")
+            else:
+                kept.append(s)
+        fresh = kept
+    return fresh, flags
+
+
+# ── Construction du contexte ─────────────────────────────────────────────────
+
+def get_btc_context(strike: Optional[float] = None,
+                    minutes_remaining: Optional[float] = None,
+                    spot_sources: tuple = None,
+                    klines_fn: Callable = None,
+                    now: Optional[float] = None,
+                    use_cache: bool = True) -> BtcMarketContext:
+    """Recupere, valide et normalise. spot_sources/klines_fn injectables
+    (tests hors-ligne). Retourne TOUJOURS un BtcMarketContext ; valid=False
+    avec 'reason' explicite si les donnees sont insuffisantes."""
+    now = now if now is not None else time.time()
+    spot_sources = spot_sources or DEFAULT_SPOT_SOURCES
+    klines_fn = klines_fn or fetch_klines_binance
+
+    def pull():
+        return [f() for f in spot_sources]
+    raw = _cached("spot_sources", CACHE_TTL_S, pull) if use_cache else pull()
+    sources, flags = _validate_sources(raw or [], now)
+
+    ctx = BtcMarketContext(valid=False, reason="", generated_ts=now,
+                           sources=sources, n_valid_sources=len(sources),
+                           quality_flags=flags,
+                           strike=strike, minutes_remaining=minutes_remaining)
+
+    if len(sources) < MIN_VALID_SOURCES:
+        ctx.reason = (f"sources_spot_insuffisantes "
+                      f"({len(sources)}/{MIN_VALID_SOURCES})")
+        return ctx
+
+    prices = [s["price"] for s in sources]
+    ctx.spot = statistics.median(prices)
+    ctx.dispersion_pct = round((max(prices) - min(prices)) / ctx.spot * 100, 4)
+
+    kl = (_cached("klines", CACHE_TTL_S, lambda: klines_fn())
+          if use_cache else klines_fn()) or []
+    # validation des timestamps des bougies (chronologie + fraicheur)
+    kl = [k for k in kl if isinstance(k.get("close"), (int, float))
+          and k["close"] > 0]
+    if kl and any(kl[i]["ts"] >= kl[i + 1]["ts"] for i in range(len(kl) - 1)):
+        flags.append("klines:timestamps_non_monotones")
+        kl = []
+    if kl and now - kl[-1]["ts"] > 3 * 60:
+        flags.append("klines:perimees")
+        kl = []
+    ctx.klines_count = len(kl)
+
+    if len(kl) >= MIN_KLINES:
+        closes = [k["close"] for k in kl]
+        def lr(n):  # log-rendement sur n minutes
+            return math.log(closes[-1] / closes[-1 - n])
+        ctx.returns = {"1m": lr(1), "3m": lr(3), "5m": lr(5), "10m": lr(10)}
+        rets = [math.log(closes[i + 1] / closes[i])
+                for i in range(len(closes) - 1)]
+        ctx.realized_vol_1m = statistics.pstdev(rets) if len(rets) >= 2 else None
+        ctx.momentum_per_min = (closes[-1] - closes[-6]) / 5 \
+            if len(closes) >= 6 else None
     else:
-        verdict    = "AUCUN TRADE"
-        prob_r     = yes_cents / 100.0
-        prob_m     = yes_cents / 100.0
-        edge       = 0.0
-        raison     = (f"Ni YES ({yes_cents}c) ni NO ({no_cents}c) n'atteint "
-                      f"le seuil de {THRESHOLD}c")
+        flags.append(f"klines:insuffisantes({len(kl)}/{MIN_KLINES})")
 
-    # Confiance basee sur la distance au seuil
-    if verdict != "AUCUN TRADE":
-        active_cents = yes_cents if verdict == "ACHETER YES" else no_cents
-        distance     = active_cents - THRESHOLD          # ex: 72c -> distance=12
-        confiance    = min(10, max(3, 3 + distance // 3)) # 60c->3, 69c->6, 90c->10
-    else:
-        confiance = 0
+    if strike is not None and strike > 0 and ctx.spot:
+        ctx.distance = round(ctx.spot - strike, 2)
+        ctx.distance_norm = math.log(ctx.spot / strike)
 
-    # Taille position selon le prix
-    if verdict == "AUCUN TRADE":
-        taille = "0%"
-    elif (yes_cents if verdict == "ACHETER YES" else no_cents) >= 80:
-        taille = "2%"
-    elif (yes_cents if verdict == "ACHETER YES" else no_cents) >= 70:
-        taille = "1%"
-    else:
-        taille = "0.5%"
+    # ── data_quality_score (0..100), documente ──
+    score = 0.0
+    score += 40.0 * min(1.0, len(sources) / 3)              # nb de sources
+    if ctx.dispersion_pct is not None:                      # accord entre elles
+        score += 20.0 * max(0.0, 1.0 - ctx.dispersion_pct / MAX_DISPERSION_PCT)
+    if ctx.realized_vol_1m is not None and ctx.realized_vol_1m > 0:
+        score += 25.0                                       # vol mesurable
+    if ctx.klines_count >= MIN_KLINES:
+        score += 15.0                                       # historique 1m
+    ctx.data_quality_score = round(score, 1)
 
-    stats = get_performance_stats()
+    if ctx.realized_vol_1m is None or ctx.realized_vol_1m <= 0:
+        ctx.reason = "volatilite_indisponible_ou_nulle"
+        return ctx
 
-    return {
-        "verdict":           verdict,
-        "prob_reelle":       round(prob_r, 4),
-        "prob_marche":       round(prob_m, 4),
-        "prob_yes_model":    yes_cents / 100.0,
-        "prob_no_model":     no_cents  / 100.0,
-        "edge":              edge,
-        "ev_brute":          0.0,
-        "ev_nette":          0.0,
-        "confiance":         confiance,
-        "risque":            10 - confiance,
-        "grade":             "A" if confiance >= 8 else "B" if confiance >= 5 else "C",
-        "raison_principale": raison,
-        "risque_principal":  "Le marche peut se retourner rapidement sur BTC 15min.",
-        "risque_exogene":    "News ou liquidation cascade peuvent invalider le signal.",
-        "taille_position":   taille,
-        "yes_cents":         yes_cents,
-        "no_cents":          no_cents,
-        "btc_price":         price or 0,
-        "perf_total":        stats["total"],
-        "perf_wr":           stats["win_rate"],
-        "perf_pnl":          stats["total_pnl"],
-    }
+    ctx.valid = True
+    ctx.reason = "ok"
+    return ctx
+
+
+def get_btc_price(spot_sources: tuple = None) -> Optional[float]:
+    """Compat : spot consensus, ou None si < 2 sources valides."""
+    ctx = get_btc_context(spot_sources=spot_sources)
+    return ctx.spot if ctx.n_valid_sources >= MIN_VALID_SOURCES else None
+
+
+def clear_cache():
+    _cache.clear()

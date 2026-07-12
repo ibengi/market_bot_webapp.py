@@ -81,6 +81,23 @@ class Config:
     MAX_POS_PCT       = _env_f("MAX_POSITION_PCT", 1.0)     # % capital / position (plafond dur)
     RISK_BUDGET_PCT   = _env_f("RISK_BUDGET_PCT", 5.0)      # % capital en risque ouvert total
     DD_THROTTLE_PCT   = _env_f("DD_THROTTLE_PCT", 10.0)     # au-dela: taille /2
+    MAX_OPEN_POSITIONS      = _env_i("MAX_OPEN_POSITIONS", 5)
+    MAX_CATEGORY_RISK_PCT   = _env_f("MAX_CATEGORY_RISK_PCT", 3.0)
+    MAX_SINGLE_MARKET_RISK_PCT = _env_f("MAX_SINGLE_MARKET_RISK_PCT", 1.0)
+    MAX_EQUITY_DRAWDOWN_PCT = _env_f("MAX_EQUITY_DRAWDOWN_PCT", 20.0)
+    # Portes edge/EV du pipeline (voir strategy_router.GateConfig)
+    MIN_MODEL_CONFIDENCE  = _env_i("MIN_MODEL_CONFIDENCE", 6)
+    MIN_GROSS_EDGE        = _env_f("MIN_GROSS_EDGE", 0.05)
+    MIN_NET_EDGE          = _env_f("MIN_NET_EDGE", 0.03)
+    MIN_NET_EV            = _env_f("MIN_NET_EV", 0.02)
+    MAX_ACCEPTABLE_SPREAD = _env_i("MAX_ACCEPTABLE_SPREAD", 4)
+    MIN_MARKET_SCORE      = _env_f("MIN_MARKET_SCORE", 50.0)
+    MIN_FILL_PROXY        = _env_f("MIN_FILL_PROXY", 40.0)
+    SLIPPAGE_BUFFER_CENTS = _env_i("SLIPPAGE_BUFFER_CENTS", 1)
+    # Solde / modes
+    ALLOW_FALLBACK_CAPITAL = _env_b("ALLOW_FALLBACK_CAPITAL", False)
+    SHADOW_MODE            = _env_b("SHADOW_MODE", False)   # decide, n'envoie pas
+    KILL_SWITCH            = _env_b("KILL_SWITCH", False)   # coupe tout ordre
     # Ordres
     ORDER_TTL_SECONDS = _env_i("ORDER_TTL_SECONDS", 45)
     ORDER_POLL_START  = 1.0
@@ -364,18 +381,72 @@ class KalshiClient:
             log_api.warning(f"get_fills({order_id}): {e}")
             return []
 
+    def get_positions(self) -> list:
+        """Positions cote broker (source de verite pour la reconciliation)."""
+        try:
+            r = self._req("GET", "/portfolio/positions")
+            self._log_raw_once("positions", r)
+            return r.get("market_positions", r.get("positions", [])) or []
+        except KalshiAPIError as e:
+            log_api.warning(f"get_positions: {e}")
+            return []
+
 # ══════════════════════════════════════════════════════════════════════════
 # S6. MODELE DE FRAIS
 # ══════════════════════════════════════════════════════════════════════════
 
 class FeeModel:
-    """Frais de trading Kalshi. Formule usuelle : 0.07 x C x P x (1-P),
-    arrondie au cent superieur. A VERIFIER contre le bareme officiel --
-    taux reglable via KALSHI_FEE_RATE_TRADING sans toucher au code."""
+    """Frais de trading Kalshi. PRIORITE : frais REELS de l'API (ordre puis
+    fills), formule locale 0.07 x C x P x (1-P) (arrondi cent sup.) en
+    SECOURS uniquement — taux reglable via KALSHI_FEE_RATE_TRADING."""
+
+    API_FIELDS = ("taker_fees", "maker_fees", "fees", "fee",
+                  "average_fee_paid", "taker_fees_dollars",
+                  "maker_fees_dollars", "fees_dollars", "fee_dollars")
+
     @staticmethod
     def trading_fee(count: int, price_cents: int) -> float:
         p = max(1, min(99, price_cents)) / 100.0
         return math.ceil(CFG.FEE_RATE * count * p * (1 - p) * 100) / 100.0
+
+    @classmethod
+    def _amount(cls, d: dict) -> Optional[float]:
+        for k in cls.API_FIELDS:
+            v = d.get(k)
+            if v in (None, ""):
+                continue
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                continue
+            if x < 0:
+                continue
+            # heuristique unites : *_dollars => $, sinon si entier >= 1 et
+            # sans point decimal dans la source, probablement des cents.
+            if k.endswith("_dollars"):
+                return round(x, 4)
+            if isinstance(v, str) and "." in v:
+                return round(x, 4)                # "0.07" => dollars
+            return round(x / 100.0, 4) if x >= 1 and float(x).is_integer() \
+                else round(x, 4)
+        return None
+
+    @classmethod
+    def from_api(cls, order_resp: dict, fills: list,
+                 count: int, price_cents: int) -> (float, str):
+        """Retourne (frais_$, fee_source). Ordre de priorite :
+        1. champs de frais de la reponse d'ordre ;
+        2. somme des frais des fills ;
+        3. formule locale (fee_source='estimated')."""
+        amt = cls._amount(order_resp or {})
+        if amt is not None:
+            return amt, "api"
+        if fills:
+            parts = [cls._amount(f) for f in fills]
+            parts = [p for p in parts if p is not None]
+            if parts:
+                return round(sum(parts), 4), "api"
+        return cls.trading_fee(count, price_cents), "estimated"
 
 # ══════════════════════════════════════════════════════════════════════════
 # S7. TRADE LOGGER (journal complet, un enregistrement = un trade REEL)
@@ -465,67 +536,166 @@ class TradeLogger:
 # ══════════════════════════════════════════════════════════════════════════
 
 class PositionManager:
+    """Positions indexees par trade_id (plusieurs lots possibles par ticker
+    si ONE_TRADE_PER_MARKET est desactive). Migration automatique de
+    l'ancienne structure ticker->pos. Reconciliation broker idempotente."""
+
     def __init__(self, client: KalshiClient, trade_log: TradeLogger):
         self.client, self.tlog = client, trade_log
-        self.positions = JsonStore.load(_p(CFG.POSITIONS_FILE), {})   # ticker -> pos
+        raw = JsonStore.load(_p(CFG.POSITIONS_FILE), {})
+        self.positions = self._migrate(raw)          # trade_id -> pos
+        self.seen_fill_ids = set(
+            JsonStore.load(_p("seen_fill_ids.json"), []))
+
+    @staticmethod
+    def _migrate(raw: dict) -> dict:
+        out = {}
+        for k, p in (raw or {}).items():
+            if "ticker" in p:                        # nouveau format
+                out[k] = p
+            else:                                    # ancien: cle = ticker
+                tid = p.get("trade_id") or f"mig-{k}"
+                out[tid] = {**p, "ticker": k}
+        return out
 
     def flush(self):
         JsonStore.save(_p(CFG.POSITIONS_FILE), self.positions)
+        JsonStore.save(_p("seen_fill_ids.json"),
+                       sorted(self.seen_fill_ids)[-5000:])
 
-    def open_position(self, trade: dict):
-        self.positions[trade["ticker"]] = {
-            "trade_id": trade["trade_id"], "side": trade["side"],
-            "count": trade["filled_count"], "avg_price": trade["avg_fill_price"],
+    def open_position(self, trade: dict, extra: dict = None):
+        pos = {
+            "trade_id": trade["trade_id"], "ticker": trade["ticker"],
+            "side": trade["side"],
+            "count_initial": trade["filled_count"],
+            "count": trade["filled_count"],
+            "avg_price": trade["avg_fill_price"],
             "fees": trade["fees"], "opened_at": trade["timestamp"],
+            "order_ids": [trade.get("order_id")],
+            "fill_ids": (extra or {}).get("fill_ids", []),
+            "state": "open",
+            "strategy": (extra or {}).get("strategy"),
+            "market_score": (extra or {}).get("market_score"),
+            "entry_edge": (extra or {}).get("entry_edge"),
+            "entry_ev": (extra or {}).get("entry_ev"),
         }
+        self.positions[trade["trade_id"]] = pos
+        for fid in pos["fill_ids"]:
+            self.seen_fill_ids.add(fid)
         self.flush()
         log_pos.info(f"{trade['ticker']}: {trade['side'].upper()} "
                      f"x{trade['filled_count']} @ {trade['avg_fill_price']}c")
 
+    def tickers_open(self) -> set:
+        return {p["ticker"] for p in self.positions.values()}
+
+    def open_count(self) -> int:
+        return len(self.positions)
+
     def open_risk(self) -> float:
         """Capital en risque = cout total des positions ouvertes (perte max)."""
-        return sum(p["count"] * p["avg_price"] / 100.0 for p in self.positions.values())
+        return sum(p["count"] * p["avg_price"] / 100.0
+                   for p in self.positions.values())
+
+    def open_risk_by_category(self) -> dict:
+        out = {}
+        for p in self.positions.values():
+            cat = p.get("category", "Other")
+            out[cat] = out.get(cat, 0.0) + p["count"] * p["avg_price"] / 100.0
+        return out
+
+    def open_risk_on(self, ticker: str) -> float:
+        return sum(p["count"] * p["avg_price"] / 100.0
+                   for p in self.positions.values() if p["ticker"] == ticker)
 
     def unrealized_pnl(self, mid_price_lookup=None) -> float:
         """PnL latent estime au prix mid courant (0 si donnee indisponible)."""
         total = 0.0
-        for tk, p in self.positions.items():
+        for p in self.positions.values():
             if not mid_price_lookup: continue
-            mid = mid_price_lookup(tk, p["side"])
+            mid = mid_price_lookup(p["ticker"], p["side"])
             if mid is None: continue
             total += p["count"] * (mid - p["avg_price"]) / 100.0
         return total
 
     def check_settlements(self) -> list:
         """Interroge l'API pour les marches regles ; realise le PnL.
-        Champs 'result'/'status' extraits de facon tolerante."""
+        Ecriture du reglement AVANT retrait de la position : un crash entre
+        les deux laisse au pire un doublon detecte (trade deja settled),
+        jamais un trade zombie."""
         realized = []
-        for ticker in list(self.positions.keys()):
-            m = self.client.get_market(ticker)
+        for tid, p in list(self.positions.items()):
+            m = self.client.get_market(p["ticker"])
             if not m: continue
             result = str(pick(m, "result", default="") or "").lower()
             status = str(pick(m, "status", default="") or "").lower()
             if result not in ("yes", "no"):
                 if status in ("settled", "finalized"):
-                    log_pos.warning(f"{ticker}: statut '{status}' mais champ "
+                    log_pos.warning(f"{p['ticker']}: statut '{status}' mais champ "
                                     f"'result' illisible -- verifier le schema API.")
                 continue
-            p    = self.positions.pop(ticker)
             won  = (result == p["side"])
             cost = p["count"] * p["avg_price"] / 100.0
             gross = (p["count"] * 1.0 - cost) if won else -cost
             net   = gross - p["fees"]
-            self.flush()
             t = self.tlog.settle_trade(p["trade_id"], result, won, gross, net)
+            self.positions.pop(tid, None)
+            self.flush()
             if t: realized.append(t)
         return realized
+
+    def reconcile_with_broker(self) -> dict:
+        """Broker = source de verite. Reconstruit les positions presentes
+        chez Kalshi mais absentes localement (id stable => idempotent),
+        marque 'ghost' les positions locales absentes du broker."""
+        report = {"rebuilt": [], "ghost": [], "matched": []}
+        broker = self.client.get_positions()
+        if broker is None:
+            return report
+        seen_tickers = set()
+        for bp in broker:
+            tk = bp.get("ticker")
+            if not tk:
+                continue
+            qty = pick_int(bp, "position", "quantity", "count", default=0)
+            if qty == 0:
+                continue
+            side = "yes" if qty > 0 else "no"
+            seen_tickers.add(tk)
+            local = [p for p in self.positions.values() if p["ticker"] == tk]
+            if local:
+                report["matched"].append(tk)
+                continue
+            tid = f"brk-{tk}-{side}"                 # ID STABLE = idempotent
+            if tid in self.positions:
+                continue
+            avg = pick_int(bp, "avg_price", "market_exposure", default=50) or 50
+            self.positions[tid] = {
+                "trade_id": tid, "ticker": tk, "side": side,
+                "count_initial": abs(qty), "count": abs(qty),
+                "avg_price": avg, "fees": 0.0, "opened_at": now_iso(),
+                "order_ids": [], "fill_ids": [], "state": "open",
+                "strategy": "reconciled", "market_score": None,
+                "entry_edge": None, "entry_ev": None,
+            }
+            report["rebuilt"].append(tk)
+        for tid, p in list(self.positions.items()):
+            if p["ticker"] not in seen_tickers and not tid.startswith("mig-"):
+                p["state"] = "ghost_local_only"
+                report["ghost"].append(p["ticker"])
+        if report["rebuilt"] or report["ghost"]:
+            self.flush()
+            JsonStore.save(_p("reconciliation_report.json"), report)
+            log_pos.warning(f"Reconciliation broker: reconstruites="
+                            f"{report['rebuilt']} fantomes={report['ghost']}")
+        return report
 
     def reconcile_startup(self):
         """Apres crash/redemarrage : les positions persistees restent valides
         (elles vivent chez le broker) ; on les re-verifie au prochain cycle."""
         if self.positions:
             log_pos.info(f"Recovery: {len(self.positions)} position(s) ouverte(s) "
-                         f"rechargee(s): {', '.join(self.positions)}")
+                         f"rechargee(s): {', '.join(self.tickers_open())}")
 
 # ══════════════════════════════════════════════════════════════════════════
 # S9. ORDER MANAGER (placement, surveillance, TTL, fills partiels, recovery)
@@ -590,6 +760,18 @@ class OrderManager:
     # -- cycle de vie complet d'un ordre --------------------------------------
     def place_and_track(self, ticker: str, side: str, count: int,
                         limit_cents: int) -> ExecutionResult:
+        # INVARIANT DUR : aucun create_order sans prix executable valide.
+        # Derniere ligne de defense contre un carnet vide qui aurait
+        # traverse scanner, ranker et validateur.
+        if limit_cents is None or not isinstance(limit_cents, (int, float)) \
+                or not (1 <= int(limit_cents) <= 99) \
+                or side not in ("yes", "no") or count <= 0:
+            log_api.error(f"ORDRE BLOQUE (invariant): {ticker} side={side} "
+                          f"count={count} limite={limit_cents!r} -- "
+                          f"prix/ask invalide, create_order NON appele.")
+            return ExecutionResult(None, count, 0, limit_cents,
+                                   "blocked:no_executable_ask", "rejected")
+        limit_cents = int(limit_cents)
         try:
             order = self.client.create_order(ticker, side, count, limit_cents)
         except KalshiAPIError as e:
@@ -939,15 +1121,27 @@ class SignalValidator:
 # ══════════════════════════════════════════════════════════════════════════
 
 try:
-    from btc_context import evaluate_btc_trade, get_btc_price
+    from btc_context import get_btc_context, get_btc_price  # v2 (contexte)
+    try:
+        from btc_context import evaluate_btc_trade   # legacy v1, optionnel
+    except ImportError:
+        evaluate_btc_trade = None
     try:
         from btc_context import VERSION as BTC_CTX_VERSION
     except ImportError:
         BTC_CTX_VERSION = "inconnue"
     BTC_AVAILABLE = True
-except ImportError as e:
+except ImportError:
+    # DESACTIVATION EXPLICITE (pas un masquage) : sans btc_context, la
+    # strategie crypto n'a AUCUN fournisseur de probabilite. Le moteur
+    # demarre (scan/rank/shadow fonctionnent) mais tout candidat crypto est
+    # rejete no_model_probability et AUCUN ordre n'est possible. Comportement
+    # verifie par test_repo_integrity (tests 6 et 7).
     BTC_AVAILABLE, BTC_CTX_VERSION = False, "absente"
-    log.error(f"btc_context indisponible: {e}")
+    log.warning("btc_context absent -- strategie crypto DESACTIVEE "
+                "explicitement: aucun modele de probabilite => aucun trade "
+                "(rejets 'no_model_probability'). Le pipeline, --scan-only, "
+                "--rank-only et --shadow restent operationnels.")
 
 class BtcStrategy:
     """Selection du marche ATM + decision par btc_context.
@@ -995,6 +1189,8 @@ class BtcStrategy:
 
     def signal(self):
         """Retourne (market, book, decision) ou (None, None, None)."""
+        if evaluate_btc_trade is None:
+            return None, None, None      # legacy indisponible (btc_context v2)
         m, mins, strike = self._select_market()
         if not m: return None, None, None
         book = MarketValidator.normalize_book(m)
@@ -1037,95 +1233,300 @@ class BtcStrategy:
         }
         return m, book, decision
 
+    def decide(self, market: dict, book: dict) -> Optional[dict]:
+        """Evaluation sur un marche/carnet fournis (utilisee par le routeur).
+        Retourne l'analyse brute ; model_prob n'est renseignee QUE si
+        btc_context fournit une probabilite independante (prob_reelle),
+        sinon None -> le routeur rejette no_model_probability. RIEN n'est
+        invente ici."""
+        if not BTC_AVAILABLE or evaluate_btc_trade is None \
+                or not market or not book:
+            return None
+        strike = pick(market, "floor_strike", "cap_strike", "strike_price",
+                      default=None)
+        try:
+            strike = float(strike)
+        except (TypeError, ValueError):
+            return None
+        ct = market.get("close_time")
+        try:
+            close_dt = datetime.fromisoformat(str(ct).replace("Z", "+00:00"))
+            mins = (close_dt - datetime.now(timezone.utc)).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            return None
+        res = evaluate_btc_trade(
+            strike_price=strike,
+            market_yes_price_cents=book.get("yes_mid",
+                                            (book["yes_bid"] + book["yes_ask"]) // 2),
+            market_no_price_cents=book.get("no_mid",
+                                           (book["no_bid"] + book["no_ask"]) // 2),
+            minutes_remaining=mins) or {}
+        verdict = res.get("verdict", "AUCUN TRADE")
+        side = "yes" if verdict == "ACHETER YES" else \
+               "no" if verdict == "ACHETER NO" else None
+        if side is None:
+            return None
+        market_p = (book.get("yes_mid", 50) if side == "yes"
+                    else book.get("no_mid", 50)) / 100.0
+        return {"verdict": verdict, "side": side,
+                "model_prob": res.get("prob_reelle"),   # None si non fournie
+                "market_prob": market_p,
+                "confidence": res.get("confiance", 0),
+                "taille": res.get("taille_position", "0.5%"),
+                "reason": res.get("raison_principale", "")}
+
 # ══════════════════════════════════════════════════════════════════════════
 # S15. MOTEUR D'EXECUTION
 # ══════════════════════════════════════════════════════════════════════════
 
 class ExecutionEngine:
+    """Cycle normal = PIPELINE INTEGRE :
+    scanner -> ranker -> routeur -> portes edge/EV -> risque -> execution
+    -> verification fills -> reconciliation. Plus de dependance exclusive
+    a KXBTC15M ; parcours multi-candidats ; carnet relu juste avant l'ordre."""
+
     def __init__(self, client: KalshiClient, capital: float):
+        from strategy_router import (StrategyRouter, GateConfig,
+                                     BtcModelStrategy)
+        from opportunity_pipeline import MarketOpportunityPipeline
+        from shadow_prediction_store import ShadowPredictionStore
         self.client   = client
-        self.capital  = capital
+        self.configured_capital = capital           # PLAFOND, pas la verite
+        self.capital  = capital                     # effectif (maj par solde)
         self.tlog     = TradeLogger()
         self.posmgr   = PositionManager(client, self.tlog)
         self.orders   = OrderManager(client)
         self.risk     = RiskManager(self.tlog, self.posmgr, capital)
         self.stats    = StatsEngine(self.tlog)
-        self.strategy = BtcStrategy(client)
-        # Recovery apres crash
+        self.strategy = BtcStrategy(client)          # analyse crypto existante
+        self.router   = StrategyRouter()
+        # Strategie modele BTC 15 minutes : UNIQUEMENT la serie KXBTC15M
+        # (supports()). Tout autre marche -> no_compatible_strategy.
+        # Contexte invalide -> no_model_probability ; qualite de donnees
+        # insuffisante -> insufficient_data_quality. Rien n'est invente.
+        self.router.register(BtcModelStrategy())
+        self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
+        self.gates = GateConfig(
+            MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
+            MIN_GROSS_EDGE=CFG.MIN_GROSS_EDGE, MIN_NET_EDGE=CFG.MIN_NET_EDGE,
+            MIN_NET_EV=CFG.MIN_NET_EV,
+            MAX_ACCEPTABLE_SPREAD=CFG.MAX_ACCEPTABLE_SPREAD,
+            MIN_MARKET_SCORE=CFG.MIN_MARKET_SCORE,
+            MIN_FILL_PROXY=CFG.MIN_FILL_PROXY,
+            SLIPPAGE_BUFFER_CENTS=CFG.SLIPPAGE_BUFFER_CENTS,
+            FEE_RATE=CFG.FEE_RATE)
+        self.pipeline = MarketOpportunityPipeline(
+            client, self.router, gates=self.gates,
+            fresh_book_fn=self.fresh_book,
+            observer=self._shadow_observer)
+        # Recovery apres crash + broker source de verite
         self.orders.reconcile_startup(self.tlog, self.posmgr)
         self.posmgr.reconcile_startup()
+        self.posmgr.reconcile_with_broker()
+
+    def fresh_book(self, ticker: str):
+        """Relecture du carnet JUSTE avant decision puis avant ordre."""
+        m = self.client.get_market(ticker) or {}
+        return m, MarketValidator.normalize_book(m)
+
+    def _shadow_observer(self, snapshot, book, dec):
+        """Journalise CHAQUE candidat BTC evalue (accepte ou rejete) dans le
+        shadow store — base de la calibration et du backtest."""
+        try:
+            if not (dec.strategy or "").startswith("btc15m"):
+                return
+            mo = getattr(dec, "model_output", None) or {}
+            feats = mo.get("features", {})
+            self.shadow_store.record(
+                ticker=dec.ticker, cycle_ts_iso=now_iso(),
+                market=snapshot.raw_market or {},
+                strike=feats.get("strike"), spot=feats.get("spot"),
+                minutes_remaining=snapshot.minutes_remaining,
+                yes_bid=(book or {}).get("yes_bid"),
+                yes_ask=(book or {}).get("yes_ask"),
+                no_bid=(book or {}).get("no_bid"),
+                no_ask=(book or {}).get("no_ask"),
+                spread=(book or {}).get("spread"),
+                ranker_score=getattr(getattr(snapshot, "quality", None),
+                                     "total_score", None),
+                features=feats,
+                probability_yes=mo.get("probability_yes"),
+                probability_no=mo.get("probability_no"),
+                confidence=mo.get("confidence"),
+                estimated_fee=dec.estimated_fees,
+                estimated_slippage=dec.expected_slippage,
+                gross_edge=dec.gross_edge, net_edge=dec.net_edge,
+                net_ev=dec.net_ev,
+                shadow_decision=(dec.side if dec.accepted else "none"),
+                decision_reason=(dec.rejection_reason or "accepted"))
+        except Exception as e:
+            log.warning(f"[SHADOW] enregistrement: {e}")
+
+    def _balance_gate(self):
+        """Solde reel a chaque cycle. effective_capital = min(plafond,
+        solde broker). Prod sans solde = blocage ; demo : secours possible
+        via ALLOW_FALLBACK_CAPITAL=1, clairement journalise."""
+        bal = self.client.get_balance()
+        if bal is not None:
+            self.capital = min(self.configured_capital, bal) \
+                if self.configured_capital else bal
+            self.risk.capital = self.capital
+            return True, f"solde={bal:.2f}$ capital_effectif={self.capital:.2f}$"
+        if self.client.env != "demo":
+            return False, "solde broker INDISPONIBLE en production -- aucun trade"
+        if CFG.ALLOW_FALLBACK_CAPITAL:
+            log_rsk.warning(f"DEMO: solde indisponible, capital de secours "
+                            f"{self.configured_capital:.2f}$ (ALLOW_FALLBACK_CAPITAL=1)")
+            self.capital = self.configured_capital
+            return True, "capital de secours (demo, journalise)"
+        return False, ("solde indisponible; en demo, ALLOW_FALLBACK_CAPITAL=1 "
+                       "requis pour un secours explicite")
 
     def cycle(self, n: int) -> int:
         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
         self.stats.maybe_daily_report()
 
-        # 1) Reglements d'abord : le PnL realise conditionne les portes de risque
-        realized = self.posmgr.check_settlements()
-        for t in realized:
+        # 0) Reglement des predictions shadow (journal de recherche)
+        try:
+            n_shadow = self.shadow_store.settle_pending(self.client.get_market)
+            if n_shadow:
+                log.info(f"[SHADOW] {n_shadow} prediction(s) reglee(s) "
+                         f"(total regle: {len(self.shadow_store.settled())})")
+        except Exception as e:
+            log.warning(f"[SHADOW] reglement: {e}")
+
+        # 1) Reglements d'abord : le PnL realise conditionne les portes
+        for _t in self.posmgr.check_settlements():
             log_rsk.info(f"PnL jour realise: {self.risk.daily_realized_pnl():+.2f}$ "
                          f"/ limite -{CFG.MAX_DAILY_LOSS:.2f}$")
 
-        # 2) Portes de risque
+        # 2) Kill switch et portes globales
+        if CFG.KILL_SWITCH:
+            log_rsk.warning("KILL_SWITCH actif -- aucun ordre ce cycle.")
+            return 0
         ok, why = self.risk.can_trade(cycle_trades=0)
         if not ok:
             log_rsk.warning(f"Trading bloque: {why}")
-            self.stats.log_summary()
+            self.stats.log_summary(); return 0
+        if self.posmgr.open_count() >= CFG.MAX_OPEN_POSITIONS:
+            log_rsk.warning(f"MAX_OPEN_POSITIONS={CFG.MAX_OPEN_POSITIONS} atteint.")
+            return 0
+        dd = self.risk.rolling_drawdown()
+        if dd >= CFG.MAX_EQUITY_DRAWDOWN_PCT:
+            log_rsk.warning(f"Drawdown {dd:.1f}% >= {CFG.MAX_EQUITY_DRAWDOWN_PCT}% "
+                            f"-- trading coupe.")
             return 0
 
-        # 3) Signal
-        market, book, dec = self.strategy.signal()
-        if not market or dec["verdict"] == "AUCUN TRADE":
-            if dec and dec.get("reason"):
-                log.info(f"AUCUN TRADE -- {dec['reason']}")
-            self.stats.log_summary()
-            return 0
-        ticker = market.get("ticker", "?")
-        log.info(f"[SIGNAL] {dec['verdict']} @ {dec['entry_price']}c | "
-                 f"prob_marche={dec['market_prob']:.0%} edge={dec['edge']:.1%} "
-                 f"conf={dec['confidence']}/10 | {dec['reason'][:70]}")
-
-        # 4) Validation du signal
-        ok, why = SignalValidator.check(dec["verdict"], dec["entry_price"],
-                                        ticker, self.tlog, self.posmgr)
+        # 3) Solde reel du broker
+        ok, why = self._balance_gate()
+        log_rsk.info(f"[CAPITAL] {why}")
         if not ok:
-            log.info(f"SIGNAL REFUSE -- {why}")
             return 0
 
-        # 5) Taille de position
+        # 4) PIPELINE integre (multi-candidats, jamais bloque sur un ticker)
+        res = self.pipeline.run_cycle(
+            max_accepted=CFG.MAX_TRADES_CYCLE,
+            skip_ticker_fn=(lambda tk: CFG.ONE_TRADE_PER_MKT and
+                            (tk in self.posmgr.tickers_open()
+                             or self.tlog.has_open_on(tk))))
+        report = res["report"]
+        placed = 0
+        for dec in res["accepted"]:
+            if placed >= CFG.MAX_TRADES_CYCLE:
+                break
+            placed += self._execute_decision(dec, report)
+        report["fills_confirmed"] = placed
+        JsonStore.save(_p("cycle_report.json"), {"cycle": n, **report})
+        log.info(f"[CYCLE-REPORT] scanned={report['scanned']} "
+                 f"eligibles={report['ranker_eligible']} acceptes={report['accepted']} "
+                 f"ordres={report['orders_submitted']} fills={placed} "
+                 f"rejets={report['rejections']}")
+        if placed == 0:
+            self.stats.log_summary()
+        return placed
+
+    def _execute_decision(self, dec, report) -> int:
+        ticker = dec.ticker
+        # 5a) carnet FRAIS une DERNIERE fois, juste avant l'ordre (TEST L)
+        m, book = self.fresh_book(ticker)
+        if not book:
+            log.info(f"CARNET DISPARU avant execution sur {ticker} -- annule.")
+            report["rejections"]["stale_book"] = \
+                report["rejections"].get("stale_book", 0) + 1
+            return 0
+        ask = book.get("yes_ask") if dec.side == "yes" else book.get("no_ask")
+        if ask is None or not (1 <= int(ask) <= 99):
+            report["rejections"]["no_executable_ask"] = \
+                report["rejections"].get("no_executable_ask", 0) + 1
+            return 0
+        entry = int(ask)
+
+        # 5b) budgets risque categorie / marche (sur capital effectif)
+        cat = dec.strategy or "Other"
+        if self.posmgr.open_risk_on(ticker) >= \
+                self.capital * CFG.MAX_SINGLE_MARKET_RISK_PCT / 100.0:
+            report["rejections"]["risk_blocked"] = \
+                report["rejections"].get("risk_blocked", 0) + 1
+            return 0
+
+        # 5c) taille sur capital EFFECTIF (solde reel plafonne) (TEST K)
         count = PositionSizer.contracts(
-            self.capital, dec["entry_price"], dec["taille"],
-            dec["confidence"], self.risk.rolling_drawdown(), self.posmgr.open_risk())
+            self.capital, entry, dec.taille, dec.confidence,
+            self.risk.rolling_drawdown(), self.posmgr.open_risk())
         if count <= 0:
-            log.info("Taille de position nulle apres contraintes de risque -- pas de trade.")
+            report["rejections"]["risk_blocked"] = \
+                report["rejections"].get("risk_blocked", 0) + 1
             return 0
 
-        # 6) Ordre REEL avec suivi des fills
-        log_trd.info(f"ORDRE -> {ticker} {dec['side'].upper()} x{count} "
-                     f"@ {dec['entry_price']}c (limite, TTL {CFG.ORDER_TTL_SECONDS}s)")
-        exec_res = self.orders.place_and_track(ticker, dec["side"], count,
-                                               dec["entry_price"])
+        est_fee_total = FeeModel.trading_fee(count, entry)
+        log_trd.info(f"[SIGNAL VALIDE] {ticker} {dec.side.upper()} x{count} "
+                     f"@ {entry}c | modele={dec.model_probability:.1%} "
+                     f"marche={dec.market_probability:.1%} "
+                     f"edge_net={dec.net_edge:+.3f} ev_net={dec.net_ev:+.3f} "
+                     f"strat={dec.strategy}")
+
+        # 5d) SHADOW : decision complete journalisee, AUCUN ordre
+        if CFG.SHADOW_MODE:
+            log_trd.info("[SHADOW] ordre NON envoye (mode shadow).")
+            report["rejections"]["shadow_mode"] = \
+                report["rejections"].get("shadow_mode", 0) + 1
+            return 0
+
+        report["orders_submitted"] = report.get("orders_submitted", 0) + 1
+        exec_res = self.orders.place_and_track(ticker, dec.side, count, entry)
         if exec_res.filled <= 0:
             log_trd.warning(f"NON EXECUTE ({exec_res.state}: {exec_res.status}) "
                             f"-- AUCUN trade enregistre.")
             return 0
 
-        # 7) Enregistrement UNIQUEMENT du trade reellement execute
-        fees = FeeModel.trading_fee(exec_res.filled, exec_res.avg_price)
+        # 5e) frais REELS d'abord (reponse d'ordre puis fills) (TEST M)
+        fills = self.client.get_fills(exec_res.order_id) if exec_res.order_id else []
+        fee_amt, fee_src = FeeModel.from_api({}, fills,
+                                             exec_res.filled, exec_res.avg_price)
         trade = self.tlog.open_trade(
-            ticker=ticker, market_title=market.get("title", ""),
-            side=dec["side"], req_price=dec["entry_price"],
+            ticker=ticker, market_title=m.get("title", ""),
+            side=dec.side, req_price=entry,
             avg_price=exec_res.avg_price, req_count=count,
-            filled_count=exec_res.filled, spread=book["spread"], fees=fees,
-            edge=dec["edge"], ev=dec["ev"], confidence=dec["confidence"],
-            grade=dec["grade"], reason=dec["reason"],
-            analysis={"market_prob": dec["market_prob"],
-                      "model_prob": dec["model_prob"]},
+            filled_count=exec_res.filled, spread=book["spread"], fees=fee_amt,
+            edge=dec.net_edge, ev=dec.net_ev, confidence=dec.confidence,
+            grade="B", reason=dec.reason,
+            analysis={"market_prob": dec.market_probability,
+                      "model_prob": dec.model_probability,
+                      "gross_edge": dec.gross_edge,
+                      "fee_source": fee_src,
+                      "estimated_fee_before_order": est_fee_total,
+                      "actual_fee_after_fill": fee_amt,
+                      "strategy": dec.strategy},
             order_id=exec_res.order_id, order_status=exec_res.status)
-        self.posmgr.open_position(trade)
+        self.posmgr.open_position(trade, extra={
+            "strategy": dec.strategy, "market_score": None,
+            "entry_edge": dec.net_edge, "entry_ev": dec.net_ev,
+            "fill_ids": [f.get("fill_id") or f.get("id")
+                         for f in fills if f.get("fill_id") or f.get("id")]})
         snap = self.risk.snapshot()
         log_rsk.info(f"risque_ouvert={snap['open_risk']}$ "
                      f"pnl_jour={snap['daily_realized_pnl']}$ "
-                     f"frais_cumules={snap['fees_paid']}$")
+                     f"frais_cumules={snap['fees_paid']}$ (source={fee_src})")
         return 1
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1166,15 +1567,41 @@ def main():
                          "market_rankings.json + market_ranker_report.json, "
                          "NE PASSE AUCUN ORDRE, puis quitte (code 0)")
     ap.add_argument("--interval", type=int, default=60)
-    ap.add_argument("--capital", type=float, default=_env_f("CAPITAL", 500.0))
+    ap.add_argument("--capital", type=float, default=_env_f("CAPITAL", 500.0),
+                    help="PLAFOND de capital; le solde broker reel prime "
+                         "s'il est inferieur")
+    ap.add_argument("--shadow", action="store_true",
+                    help="mode shadow: pipeline et decisions complets, "
+                         "AUCUN ordre envoye")
     args = ap.parse_args()
+    if args.shadow:
+        CFG.SHADOW_MODE = True
 
-    env = "demo" if args.demo else "prod"
-    if env == "prod" and os.getenv("KALSHI_ENV_CONFIRM", "") != "LIVE":
-        log.error("Environnement PRODUCTION demande sans confirmation. "
-                  "Definir KALSHI_ENV_CONFIRM=LIVE pour autoriser les ordres reels "
-                  "en production. Arret.")
-        sys.exit(1)
+    env = "demo" if (args.demo or os.getenv("DEMO_TRADING", "") == "1") \
+        else "prod"
+    if env == "prod" and not (args.scan_only or args.rank_only):
+        # DOUBLE confirmation exigee pour l'argent reel.
+        if os.getenv("KALSHI_ENV_CONFIRM", "") != "LIVE":
+            log.error("PRODUCTION demandee sans KALSHI_ENV_CONFIRM=LIVE. Arret.")
+            sys.exit(1)
+        if os.getenv("LIVE_TRADING_CONFIRMED", "") != "YES" \
+                and not CFG.SHADOW_MODE:
+            log.error("PRODUCTION demandee sans LIVE_TRADING_CONFIRMED=YES. "
+                      "Definir les DEUX variables, ou utiliser --shadow. Arret.")
+            sys.exit(1)
+        if os.getenv("LIVE_TRADING", "") != "1":
+            log.error("PRODUCTION: LIVE_TRADING=1 requis (interdit par defaut). Arret.")
+            sys.exit(1)
+        # GATEKEEPER : le live reste bloque sans validation modele recente.
+        from model_gatekeeper import check_live_allowed
+        ok_gate, failed = check_live_allowed()
+        if not ok_gate:
+            log.error("GATEKEEPER: live REFUSE. Criteres echoues:")
+            for f in failed:
+                log.error(f"  - {f}")
+            sys.exit(1)
+        log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
+                    "gatekeeper valides).")
 
     client = KalshiClient(env)
     banner(client, args.capital)

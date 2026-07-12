@@ -1,0 +1,17 @@
+{
+ "generated": "2026-07-12T03:54:29+00:00",
+ "command": "python run_tests.py (unittest discover)",
+ "ran": 116,
+ "passed": 114,
+ "failed": 0,
+ "errors": 0,
+ "skipped": 2,
+ "skipped_detail": [
+  "test_audit_v11.SpecModules.test_D8_debug_kalshi_must_compile: debug_kalshi.py (herite) absent du depot -- recommande supprime; test temoin non applicable",
+  "test_audit_v11.SpecResolverCoherence.test_D6_two_fee_models_must_agree: trade_resolver.py (herite) absent du depot -- recommande supprime; test temoin non applicable"
+ ],
+ "failed_detail": [],
+ "error_detail": [],
+ "success": true,
+ "coverage": "non mesuree par ce runner; executer 'pip install pytest pytest-cov && pytest --cov' pour un pourcentage"
+}

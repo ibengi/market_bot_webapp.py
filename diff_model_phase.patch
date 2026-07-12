@@ -1,0 +1,357 @@
+--- /home/claude/freshtest/strategy_router.py	2026-07-11 23:11:52.000000000 +0000
++++ strategy_router.py	2026-07-12 03:50:11.357682198 +0000
+@@ -33,6 +33,7 @@
+     "no_positive_edge", "insufficient_net_edge", "negative_net_ev",
+     "spread_too_wide", "no_executable_ask", "market_quality_too_low",
+     "stale_book", "already_open", "risk_blocked",
++    "insufficient_data_quality", "model_not_calibrated",
+ )
+ 
+ @dataclass
+@@ -45,7 +46,9 @@
+     MIN_MARKET_SCORE: float = 50.0
+     MIN_FILL_PROXY: float = 40.0
+     SLIPPAGE_BUFFER_CENTS: int = 1
+-    FEE_RATE: float = 0.07          # fallback local documente (a verifier)
++    UNCERTAINTY_BUFFER: float = 0.01     # marge d'incertitude modele (edge)
++    FEE_RATE: float = 0.07               # fallback local documente (a verifier)
++    REQUIRE_CALIBRATED: bool = False     # True en LIVE : modele calibre exige
+ 
+ @dataclass
+ class SignalDecision:
+@@ -66,6 +69,7 @@
+     strategy: Optional[str] = None
+     taille: str = "0.5%"
+     reason: str = ""
++    model_output: Optional[dict] = None
+ 
+ def estimated_fee_per_contract(price_cents: int, fee_rate: float) -> float:
+     """Fallback LOCAL documente: ceil(rate*P*(1-P)) au cent, par contrat.
+@@ -104,10 +108,12 @@
+         if q.fill_probability_score < gates.MIN_FILL_PROXY:
+             d.rejection_reason = "market_quality_too_low"; return d
+ 
+-    # 1) strategie compatible ?
++    # 1) strategie compatible ? (categorie PUIS compatibilite fine du marche)
+     strat = router.strategy_for(snapshot.category)
+     if strat is None:
+         d.rejection_reason = "no_compatible_strategy"; return d
++    if hasattr(strat, "supports") and not strat.supports(snapshot):
++        d.rejection_reason = "no_compatible_strategy"; return d
+     d.strategy = getattr(strat, "name", strat.__class__.__name__)
+ 
+     # 2) carnet frais exploitable ?
+@@ -119,19 +125,29 @@
+ 
+     # 3) probabilite modele INDEPENDANTE
+     out = strat.evaluate(snapshot, fresh_market, book)
++    if isinstance(out, dict) and out.get("rejection_reason"):
++        d.rejection_reason = out["rejection_reason"]        # ex: qualite data
++        d.reason = str(out.get("reason", ""))[:160]
++        return d
+     if not out or out.get("model_prob") is None:
+         d.rejection_reason = "no_model_probability"; return d
+     side = out.get("side")
+     if side not in ("yes", "no"):
+         d.rejection_reason = "no_model_probability"; return d
+     model_p = float(out["model_prob"])
+-    if not (0.0 < model_p < 1.0):
++    if not (0.0 < model_p < 1.0) or model_p != model_p:
+         d.rejection_reason = "no_model_probability"; return d
+     d.side, d.model_probability = side, model_p
+-    d.confidence = int(out.get("confidence", 0))
++    conf = out.get("confidence", 0)
++    # confiance acceptee en 0..1 (modele) ou 0..10 (legacy)
++    d.confidence = int(round(conf * 10)) if isinstance(conf, float) \
++        and conf <= 1.0 else int(conf)
+     d.taille = out.get("taille", "0.5%")
+     d.reason = str(out.get("reason", ""))[:160]
++    d.model_output = out.get("model_output")
+ 
++    if gates.REQUIRE_CALIBRATED and not out.get("calibrated", False):
++        d.rejection_reason = "model_not_calibrated"; return d
+     if d.confidence < gates.MIN_MODEL_CONFIDENCE:
+         d.rejection_reason = "insufficient_confidence"; return d
+ 
+@@ -155,8 +171,10 @@
+     d.estimated_fees = estimated_fee_per_contract(d.entry_price_cents,
+                                                   gates.FEE_RATE)
+     d.expected_slippage = gates.SLIPPAGE_BUFFER_CENTS / 100.0
+-    d.net_edge = d.gross_edge - d.estimated_fees - d.expected_slippage
+-    d.net_ev = d.expected_gross_value - d.estimated_fees - d.expected_slippage
++    d.net_edge = d.gross_edge - d.estimated_fees - d.expected_slippage \
++        - gates.UNCERTAINTY_BUFFER
++    d.net_ev = d.expected_gross_value - d.estimated_fees - d.expected_slippage \
++        - gates.UNCERTAINTY_BUFFER
+     if d.net_edge < gates.MIN_NET_EDGE:
+         d.rejection_reason = "insufficient_net_edge"; return d
+     if d.net_ev < gates.MIN_NET_EV:
+@@ -200,3 +218,73 @@
+                 "confidence": int(dec.get("confidence", 0)),
+                 "taille": dec.get("taille", "0.5%"),
+                 "reason": dec.get("reason", "")}
++
++
++# ── Strategie BTC 15 minutes basee sur le modele de probabilite ──────────────
++
++class BtcModelStrategy:
++    """Strategie BTC15M : contexte via btc_context, probabilite via
++    btc_probability_model. NE S'APPLIQUE QU'AUX marches de la serie BTC 15
++    minutes (supports()) : ETH, sports, politique, meteo etc. restent
++    no_compatible_strategy. Si le contexte echoue -> no_model_probability ;
++    si la qualite des donnees est insuffisante -> insufficient_data_quality.
++    AUCUNE probabilite n'est inventee."""
++    name = "btc15m_model_v1"
++    categories = ["Crypto"]
++    SERIES_PREFIX = "KXBTC15M"
++
++    def __init__(self, context_provider=None, model_predict=None):
++        # injectables pour tests hors-ligne ; par defaut, les vrais modules
++        if context_provider is None or model_predict is None:
++            import btc_context as _ctx
++            import btc_probability_model as _mdl
++            context_provider = context_provider or _ctx.get_btc_context
++            model_predict = model_predict or _mdl.predict_or_reason
++        self.context_provider = context_provider
++        self.model_predict = model_predict
++
++    def supports(self, snapshot) -> bool:
++        for attr in ("series_ticker", "ticker"):
++            v = getattr(snapshot, attr, None) or ""
++            if str(v).upper().startswith(self.SERIES_PREFIX):
++                return True
++        return False
++
++    @staticmethod
++    def _strike(market: dict):
++        for k in ("floor_strike", "cap_strike", "strike_price"):
++            v = market.get(k)
++            if v is not None:
++                try:
++                    return float(v)
++                except (TypeError, ValueError):
++                    pass
++        return None
++
++    def evaluate(self, snapshot, fresh_market, book):
++        strike = self._strike(fresh_market or {})
++        mins = getattr(snapshot, "minutes_remaining", None)
++        if strike is None or mins is None:
++            return {"rejection_reason": "no_model_probability",
++                    "reason": "strike ou temps restant absent"}
++        try:
++            ctx = self.context_provider(strike=strike, minutes_remaining=mins)
++        except Exception as e:                    # echec contexte = pas de prob
++            return {"rejection_reason": "no_model_probability",
++                    "reason": f"btc_context: {e}"}
++        out, why = self.model_predict(ctx)
++        if out is None:
++            reason = ("insufficient_data_quality"
++                      if why and "insufficient_data_quality" in why
++                      else "no_model_probability")
++            return {"rejection_reason": reason, "reason": why or ""}
++        p_yes = out["probability_yes"]
++        side = "yes" if p_yes >= 0.5 else "no"
++        return {"side": side,
++                "model_prob": p_yes if side == "yes"
++                              else out["probability_no"],
++                "confidence": out["confidence"],          # 0..1 -> mappee
++                "calibrated": out.get("calibrated", False),
++                "taille": "0.5%",
++                "reason": f"{out['model_version']}: {out['reason'][:90]}",
++                "model_output": out}
+--- /home/claude/freshtest/opportunity_pipeline.py	2026-07-11 23:11:52.000000000 +0000
++++ opportunity_pipeline.py	2026-07-12 03:50:11.365450404 +0000
+@@ -29,7 +29,10 @@
+                  scan_cfg: ScanConfig = None,
+                  rank_cfg: RankConfig = None,
+                  fresh_book_fn: Optional[Callable] = None,
+-                 save_artifacts: bool = True):
++                 save_artifacts: bool = True,
++                 observer: Optional[Callable] = None):
++        """observer(snapshot, book, decision) : appele pour CHAQUE candidat
++        evalue (accepte ou rejete) — utilise par le journal shadow."""
+         """fresh_book_fn(ticker) -> (fresh_market_dict, normalized_book|None)
+         Fournie par le moteur : relecture du carnet JUSTE avant decision.
+         Si None, le carnet du snapshot (age du scan) est utilise — reserve
+@@ -41,6 +44,7 @@
+         self.rank_cfg = rank_cfg or RankConfig()
+         self.fresh_book_fn = fresh_book_fn
+         self.save_artifacts = save_artifacts
++        self.observer = observer
+ 
+     # ── un cycle complet ─────────────────────────────────────────────────
+     def run_cycle(self, max_accepted: int = 1,
+@@ -89,6 +93,11 @@
+ 
+             dec = evaluate_candidate(snap, fresh_market or {}, book,
+                                      self.router, self.gates)
++            if self.observer:
++                try:
++                    self.observer(snap, book, dec)
++                except Exception as e:
++                    log.warning(f"observer: {e}")
+             if dec.strategy:
+                 supported += 1
+             if dec.gross_edge is not None and dec.gross_edge > 0:
+--- /home/claude/freshtest/kalshi_alpha_bot.py	2026-07-11 23:12:17.000000000 +0000
++++ kalshi_alpha_bot.py	2026-07-12 03:50:11.424451990 +0000
+@@ -1121,7 +1121,11 @@
+ # ══════════════════════════════════════════════════════════════════════════
+ 
+ try:
+-    from btc_context import evaluate_btc_trade, get_btc_price
++    from btc_context import get_btc_context, get_btc_price  # v2 (contexte)
++    try:
++        from btc_context import evaluate_btc_trade   # legacy v1, optionnel
++    except ImportError:
++        evaluate_btc_trade = None
+     try:
+         from btc_context import VERSION as BTC_CTX_VERSION
+     except ImportError:
+@@ -1185,6 +1189,8 @@
+ 
+     def signal(self):
+         """Retourne (market, book, decision) ou (None, None, None)."""
++        if evaluate_btc_trade is None:
++            return None, None, None      # legacy indisponible (btc_context v2)
+         m, mins, strike = self._select_market()
+         if not m: return None, None, None
+         book = MarketValidator.normalize_book(m)
+@@ -1233,7 +1239,8 @@
+         btc_context fournit une probabilite independante (prob_reelle),
+         sinon None -> le routeur rejette no_model_probability. RIEN n'est
+         invente ici."""
+-        if not BTC_AVAILABLE or not market or not book:
++        if not BTC_AVAILABLE or evaluate_btc_trade is None \
++                or not market or not book:
+             return None
+         strike = pick(market, "floor_strike", "cap_strike", "strike_price",
+                       default=None)
+@@ -1280,8 +1287,9 @@
+ 
+     def __init__(self, client: KalshiClient, capital: float):
+         from strategy_router import (StrategyRouter, GateConfig,
+-                                     CryptoShortTermStrategy)
++                                     BtcModelStrategy)
+         from opportunity_pipeline import MarketOpportunityPipeline
++        from shadow_prediction_store import ShadowPredictionStore
+         self.client   = client
+         self.configured_capital = capital           # PLAFOND, pas la verite
+         self.capital  = capital                     # effectif (maj par solde)
+@@ -1292,12 +1300,12 @@
+         self.stats    = StatsEngine(self.tlog)
+         self.strategy = BtcStrategy(client)          # analyse crypto existante
+         self.router   = StrategyRouter()
+-        # La strategie crypto n'est routee QUE vers Crypto ; elle ne repond
+-        # que si btc_context fournit une prob modele independante, sinon
+-        # rejet no_model_probability (aucune probabilite inventee).
+-        self.router.register(CryptoShortTermStrategy(
+-            decision_fn=(lambda s, m, b: self.strategy.decide(m, b))
+-            if BTC_AVAILABLE else None))
++        # Strategie modele BTC 15 minutes : UNIQUEMENT la serie KXBTC15M
++        # (supports()). Tout autre marche -> no_compatible_strategy.
++        # Contexte invalide -> no_model_probability ; qualite de donnees
++        # insuffisante -> insufficient_data_quality. Rien n'est invente.
++        self.router.register(BtcModelStrategy())
++        self.shadow_store = ShadowPredictionStore(_p("shadow_predictions.json"))
+         self.gates = GateConfig(
+             MIN_MODEL_CONFIDENCE=CFG.MIN_MODEL_CONFIDENCE,
+             MIN_GROSS_EDGE=CFG.MIN_GROSS_EDGE, MIN_NET_EDGE=CFG.MIN_NET_EDGE,
+@@ -1309,7 +1317,8 @@
+             FEE_RATE=CFG.FEE_RATE)
+         self.pipeline = MarketOpportunityPipeline(
+             client, self.router, gates=self.gates,
+-            fresh_book_fn=self.fresh_book)
++            fresh_book_fn=self.fresh_book,
++            observer=self._shadow_observer)
+         # Recovery apres crash + broker source de verite
+         self.orders.reconcile_startup(self.tlog, self.posmgr)
+         self.posmgr.reconcile_startup()
+@@ -1320,6 +1329,39 @@
+         m = self.client.get_market(ticker) or {}
+         return m, MarketValidator.normalize_book(m)
+ 
++    def _shadow_observer(self, snapshot, book, dec):
++        """Journalise CHAQUE candidat BTC evalue (accepte ou rejete) dans le
++        shadow store — base de la calibration et du backtest."""
++        try:
++            if not (dec.strategy or "").startswith("btc15m"):
++                return
++            mo = getattr(dec, "model_output", None) or {}
++            feats = mo.get("features", {})
++            self.shadow_store.record(
++                ticker=dec.ticker, cycle_ts_iso=now_iso(),
++                market=snapshot.raw_market or {},
++                strike=feats.get("strike"), spot=feats.get("spot"),
++                minutes_remaining=snapshot.minutes_remaining,
++                yes_bid=(book or {}).get("yes_bid"),
++                yes_ask=(book or {}).get("yes_ask"),
++                no_bid=(book or {}).get("no_bid"),
++                no_ask=(book or {}).get("no_ask"),
++                spread=(book or {}).get("spread"),
++                ranker_score=getattr(getattr(snapshot, "quality", None),
++                                     "total_score", None),
++                features=feats,
++                probability_yes=mo.get("probability_yes"),
++                probability_no=mo.get("probability_no"),
++                confidence=mo.get("confidence"),
++                estimated_fee=dec.estimated_fees,
++                estimated_slippage=dec.expected_slippage,
++                gross_edge=dec.gross_edge, net_edge=dec.net_edge,
++                net_ev=dec.net_ev,
++                shadow_decision=(dec.side if dec.accepted else "none"),
++                decision_reason=(dec.rejection_reason or "accepted"))
++        except Exception as e:
++            log.warning(f"[SHADOW] enregistrement: {e}")
++
+     def _balance_gate(self):
+         """Solde reel a chaque cycle. effective_capital = min(plafond,
+         solde broker). Prod sans solde = blocage ; demo : secours possible
+@@ -1344,6 +1386,15 @@
+         log.info(f"── CYCLE #{n} ─────────────────────────────────────────────")
+         self.stats.maybe_daily_report()
+ 
++        # 0) Reglement des predictions shadow (journal de recherche)
++        try:
++            n_shadow = self.shadow_store.settle_pending(self.client.get_market)
++            if n_shadow:
++                log.info(f"[SHADOW] {n_shadow} prediction(s) reglee(s) "
++                         f"(total regle: {len(self.shadow_store.settled())})")
++        except Exception as e:
++            log.warning(f"[SHADOW] reglement: {e}")
++
+         # 1) Reglements d'abord : le PnL realise conditionne les portes
+         for _t in self.posmgr.check_settlements():
+             log_rsk.info(f"PnL jour realise: {self.risk.daily_realized_pnl():+.2f}$ "
+@@ -1526,7 +1577,8 @@
+     if args.shadow:
+         CFG.SHADOW_MODE = True
+ 
+-    env = "demo" if args.demo else "prod"
++    env = "demo" if (args.demo or os.getenv("DEMO_TRADING", "") == "1") \
++        else "prod"
+     if env == "prod" and not (args.scan_only or args.rank_only):
+         # DOUBLE confirmation exigee pour l'argent reel.
+         if os.getenv("KALSHI_ENV_CONFIRM", "") != "LIVE":
+@@ -1537,7 +1589,19 @@
+             log.error("PRODUCTION demandee sans LIVE_TRADING_CONFIRMED=YES. "
+                       "Definir les DEUX variables, ou utiliser --shadow. Arret.")
+             sys.exit(1)
+-        log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation recue).")
++        if os.getenv("LIVE_TRADING", "") != "1":
++            log.error("PRODUCTION: LIVE_TRADING=1 requis (interdit par defaut). Arret.")
++            sys.exit(1)
++        # GATEKEEPER : le live reste bloque sans validation modele recente.
++        from model_gatekeeper import check_live_allowed
++        ok_gate, failed = check_live_allowed()
++        if not ok_gate:
++            log.error("GATEKEEPER: live REFUSE. Criteres echoues:")
++            for f in failed:
++                log.error(f"  - {f}")
++            sys.exit(1)
++        log.warning("PRODUCTION REAL MONEY ENABLED (double confirmation + "
++                    "gatekeeper valides).")
+ 
+     client = KalshiClient(env)
+     banner(client, args.capital)
