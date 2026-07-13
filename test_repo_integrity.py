@@ -19,7 +19,7 @@ from datetime import datetime, timezone, timedelta
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-CORE_MODULES = ["market_scanner", "market_ranker", "strategy_router",
+CORE_MODULES = ["market_taxonomy", "market_scanner", "market_ranker", "strategy_router",
                 "opportunity_pipeline", "pattern_engine",
                 "kalshi_edge_measure", "btc_context",
                 "btc_probability_model", "model_calibration",
@@ -27,7 +27,8 @@ CORE_MODULES = ["market_scanner", "market_ranker", "strategy_router",
                 "model_gatekeeper", "kalshi_alpha_bot"]
 TEST_MODULES = ["test_market_scanner", "test_market_ranker",
                 "test_audit_v11", "test_integration_pipeline",
-                "test_model_research", "test_repo_integrity"]
+                "test_model_research", "test_market_taxonomy",
+                "test_repo_integrity"]
 DECLARED_THIRD_PARTY = {"requests", "cryptography", "dotenv",
                         "pytest", "pytest_cov",
                         "sklearn"}   # optionnel: import protege (calibration)

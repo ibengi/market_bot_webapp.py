@@ -39,6 +39,9 @@ class StubStrategy:
         self.name = "stub"
         self.prob_by_ticker = prob_by_ticker
         self.confidence = confidence
+    def supports(self, snapshot):
+        return snapshot.category in self.categories
+
     def evaluate(self, snapshot, market, book):
         p = self.prob_by_ticker.get(snapshot.ticker)
         if p is None:

@@ -34,6 +34,7 @@ REJECTION_REASONS = (
     "spread_too_wide", "no_executable_ask", "market_quality_too_low",
     "stale_book", "already_open", "risk_blocked",
     "insufficient_data_quality", "model_not_calibrated",
+    "ambiguous_strategy_match",
 )
 
 @dataclass
@@ -78,19 +79,43 @@ def estimated_fee_per_contract(price_cents: int, fee_rate: float) -> float:
     return math.ceil(fee_rate * p * (1 - p) * 100) / 100.0
 
 class StrategyRouter:
-    """category -> strategie. Categories sans strategie => rejet explicite."""
+    """Routeur STRICT. Chaque strategie DOIT exposer supports(snapshot).
+    - 0 correspondance  -> (None, "no_compatible_strategy")
+    - 1 correspondance  -> (strategie, None)
+    - >1 correspondance -> (None, "ambiguous_strategy_match")
+    Jamais de choix silencieux de la premiere strategie ; jamais de routage
+    par categorie generale seule."""
     def __init__(self):
-        self._by_category = {}
+        self._strategies = []
 
     def register(self, strategy):
-        for cat in getattr(strategy, "categories", []):
-            self._by_category[cat] = strategy
+        if not callable(getattr(strategy, "supports", None)):
+            log.warning(f"Strategie {getattr(strategy,'name',strategy)} sans "
+                        f"supports(): REFUSEE par le routeur strict.")
+            return
+        self._strategies.append(strategy)
 
-    def strategy_for(self, category: str):
-        return self._by_category.get(category)
+    def strategies(self) -> list:
+        return list(self._strategies)
 
+    def resolve(self, snapshot):
+        """(strategie|None, raison_rejet|None)"""
+        matches = [s for s in self._strategies if s.supports(snapshot)]
+        if not matches:
+            return None, "no_compatible_strategy"
+        if len(matches) > 1:
+            names = [getattr(s, "name", s.__class__.__name__) for s in matches]
+            log.warning(f"{snapshot.ticker}: correspondance AMBIGUE "
+                        f"({names}) -- rejet.")
+            return None, "ambiguous_strategy_match"
+        return matches[0], None
+
+    # compat lecture seule (diagnostic)
     def supported_categories(self) -> list:
-        return sorted(self._by_category)
+        cats = set()
+        for s in self._strategies:
+            cats.update(getattr(s, "categories", []))
+        return sorted(cats)
 
 def evaluate_candidate(snapshot, fresh_market: dict, book: dict,
                        router: StrategyRouter,
@@ -108,12 +133,10 @@ def evaluate_candidate(snapshot, fresh_market: dict, book: dict,
         if q.fill_probability_score < gates.MIN_FILL_PROXY:
             d.rejection_reason = "market_quality_too_low"; return d
 
-    # 1) strategie compatible ? (categorie PUIS compatibilite fine du marche)
-    strat = router.strategy_for(snapshot.category)
+    # 1) resolution STRICTE par supports() (jamais par categorie seule)
+    strat, why = router.resolve(snapshot)
     if strat is None:
-        d.rejection_reason = "no_compatible_strategy"; return d
-    if hasattr(strat, "supports") and not strat.supports(snapshot):
-        d.rejection_reason = "no_compatible_strategy"; return d
+        d.rejection_reason = why; return d
     d.strategy = getattr(strat, "name", strat.__class__.__name__)
 
     # 2) carnet frais exploitable ?
@@ -244,9 +267,17 @@ class BtcModelStrategy:
         self.model_predict = model_predict
 
     def supports(self, snapshot) -> bool:
+        """Triple verrou impose : categorie Crypto ET market_type
+        btc_above_strike_15m ET prefixe KXBTC15M. BTC horaire, ETH, daily
+        et tout le reste sont refuses ici."""
+        if getattr(snapshot, "category", None) != "Crypto":
+            return False
+        mt = getattr(snapshot, "market_type", None)
+        if mt is not None and mt != "btc_above_strike_15m":
+            return False
         for attr in ("series_ticker", "ticker"):
-            v = getattr(snapshot, attr, None) or ""
-            if str(v).upper().startswith(self.SERIES_PREFIX):
+            v = str(getattr(snapshot, attr, None) or "").upper()
+            if v.startswith(self.SERIES_PREFIX):
                 return True
         return False
 
@@ -288,3 +319,18 @@ class BtcModelStrategy:
                 "taille": "0.5%",
                 "reason": f"{out['model_version']}: {out['reason'][:90]}",
                 "model_output": out}
+
+
+# ── Registre central : UNIQUEMENT les strategies reelles et testees ──────────
+# Pas de fausse strategie Sports/Politics/Economics : ces marches restent
+# no_compatible_strategy tant qu'un vrai modele dedie n'existe pas.
+
+def available_strategies() -> list:
+    return [BtcModelStrategy]
+
+
+def build_default_router() -> "StrategyRouter":
+    r = StrategyRouter()
+    for cls in available_strategies():
+        r.register(cls())
+    return r

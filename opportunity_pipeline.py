@@ -16,6 +16,7 @@ import logging
 from typing import Optional, Callable
 
 from market_scanner import run_scan, ScanConfig, MarketSnapshot
+from market_taxonomy import classification_report
 from market_ranker import run_ranking, RankConfig
 from strategy_router import (StrategyRouter, GateConfig, SignalDecision,
                              evaluate_candidate)
@@ -98,6 +99,10 @@ class MarketOpportunityPipeline:
         positive_edge = 0
         with_model_prob = 0
         positive_net_ev = 0
+        n_classified = 0
+        n_unknown_type = 0
+        n_ambiguous = 0
+        n_prefiltered = 0
         self.last_traces = []
 
         eligible = [q for q in scores if q.eligible]
@@ -115,9 +120,37 @@ class MarketOpportunityPipeline:
             examined += 1
             log.info(f"[RANK] {q.ticker} | cat={q.category} "
                      f"| score={q.total_score}")
+            mt = getattr(snap, "market_type", "unknown")
+            log.info(f"[CLASSIFY] {q.ticker} category={q.category} "
+                     f"market_type={mt}")
+            if mt == "unknown":
+                n_unknown_type += 1
+            else:
+                n_classified += 1
 
             if skip_ticker_fn and skip_ticker_fn(q.ticker):
                 rejections["already_open"] = rejections.get("already_open", 0) + 1
+                continue
+
+            # ── PRE-FILTRAGE STRATEGIE (optimisation imposee) ──
+            # Resolution AVANT fresh_book_fn et AVANT tout appel externe du
+            # modele : un marche sans strategie compatible ne coute plus
+            # aucun appel API.
+            pre_strat, pre_why = self.router.resolve(snap)
+            if pre_strat is None:
+                n_prefiltered += 1
+                if pre_why == "ambiguous_strategy_match":
+                    n_ambiguous += 1
+                rejections[pre_why] = rejections.get(pre_why, 0) + 1
+                log.info(f"[REJECT] {q.ticker} {pre_why}")
+                self.last_traces.append({
+                    "ticker": q.ticker, "ranker_score": q.total_score,
+                    "category": q.category, "market_type": mt,
+                    "strategy": None, "model_probability": None,
+                    "confidence": None, "market_probability": None,
+                    "gross_edge": None, "estimated_fees": None,
+                    "slippage": None, "net_edge": None, "net_ev": None,
+                    "decision": "REJECT", "reject_reason": pre_why})
                 continue
 
             # carnet FRAIS si le moteur fournit la fonction, sinon snapshot
@@ -200,6 +233,10 @@ class MarketOpportunityPipeline:
             "ranker_eligible": rep_rank["eligible"],
             "eligible": rep_rank["eligible"],
             "candidates_examined": examined,
+            "classified": n_classified,
+            "unknown_market_type": n_unknown_type,
+            "prefiltered_no_strategy": n_prefiltered,
+            "ambiguous_strategy_match": n_ambiguous,
             "strategy_supported": supported,
             "model_probability": with_model_prob,
             "positive_edge": positive_edge,
@@ -213,6 +250,9 @@ class MarketOpportunityPipeline:
         }
         report["valid"] = report["scanner_included"]
         if self.save_artifacts:
+            from market_scanner import _save_json as _sj
+            _sj("classification_report.json",
+                classification_report(own_snapshots))
             top = sorted(self.last_traces,
                          key=lambda r: r["ranker_score"], reverse=True)[:20]
             from market_scanner import _save_json

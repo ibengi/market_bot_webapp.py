@@ -23,6 +23,8 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from typing import Optional, Callable
 
+from market_taxonomy import classify_market_type
+
 log = logging.getLogger("SCANNER")
 
 # ── Configuration (surchargeables par variables d'environnement) ─────────────
@@ -201,6 +203,7 @@ class MarketSnapshot:
     title: Optional[str]
     subtitle: Optional[str]
     category: str
+    market_type: str
     status: Optional[str]
     open_time: Optional[str]
     close_time: Optional[str]
@@ -238,6 +241,7 @@ def build_snapshot(m: dict, now: Optional[datetime] = None,
         series_ticker=m.get("series_ticker"),
         title=m.get("title"), subtitle=m.get("subtitle") or m.get("yes_sub_title"),
         category=classify(m),
+        market_type=classify_market_type(m),
         status=m.get("status"),
         open_time=m.get("open_time"), close_time=m.get("close_time"),
         expiration_time=m.get("expiration_time"),
