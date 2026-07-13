@@ -52,24 +52,44 @@ class MarketOpportunityPipeline:
         """Retourne {"accepted": [SignalDecision...], "report": {...}}.
         Parcourt les candidats du meilleur au moins bon ; n'abandonne pas
         au premier rejet ; s'arrete a max_accepted ou epuisement."""
-        ranking = run_ranking(self.client, scan_cfg=self.scan_cfg,
-                              cfg=self.rank_cfg, save=self.save_artifacts)
+        # ── CORRECTION DESYNCHRONISATION (2026-07-12) ──
+        # Avant : le pipeline dependait du retour "snapshots" de
+        # market_ranker.run_ranking ; toute version anterieure du ranker
+        # (sans cette cle) faisait tomber 100% des eligibles en
+        # snapshot_missing. Desormais le pipeline est PROPRIETAIRE du scan :
+        # il scanne lui-meme, garde ses snapshots, et les FOURNIT au ranker
+        # (parametre `snapshots` present dans toutes les versions du ranker).
+        # Le couplage par valeur de retour est supprime ; un melange de
+        # versions de fichiers ne peut plus provoquer cette panne.
+        scan = run_scan(self.client, cfg=self.scan_cfg,
+                        save=self.save_artifacts)
+        own_snapshots = scan["snapshots"]
+        try:
+            ranking = run_ranking(self.client, scan_cfg=self.scan_cfg,
+                                  cfg=self.rank_cfg, save=self.save_artifacts,
+                                  snapshots=own_snapshots)
+        except TypeError:
+            # market_ranker ANCIEN (sans parametre `snapshots`) deploye a
+            # cote d'un pipeline recent : mode degrade tolere -- le ranker
+            # re-scanne en interne (cout: un scan de plus), mais la
+            # correspondance se fait sur NOS snapshots, par ticker. Plus
+            # aucun snapshot_missing possible du fait d'un melange de
+            # versions.
+            log.warning("[PIPELINE] market_ranker.py ANCIEN detecte (pas de "
+                        "parametre 'snapshots') -- mode degrade actif. "
+                        "Mettre a jour market_ranker.py pour eviter le "
+                        "double scan.")
+            ranking = run_ranking(self.client, scan_cfg=self.scan_cfg,
+                                  cfg=self.rank_cfg, save=self.save_artifacts)
         scores = ranking["scores"]
         rep_rank = ranking["report"]
-        snaps_by_ticker = {}
-        # run_ranking re-scanne : retrouver les snapshots via history n'est
-        # pas fiable ; on rescanne les snapshots depuis le rapport interne.
-        # run_ranking garde l'ordre des scores ; les snapshots sont fournis
-        # par run_scan a l'interieur — on les reconstruit via raw si absent.
-        for s in ranking.get("snapshots", []):
-            snaps_by_ticker[s.ticker] = s
-        log.info(f"[PIPELINE] snapshots recus du ranker: {len(snaps_by_ticker)} "
-                 f"| scores: {len(scores)} | eligibles: {rep_rank['eligible']}")
+        snaps_by_ticker = {s.ticker: s for s in own_snapshots}
+        log.info(f"[PIPELINE] snapshots (scan pipeline): "
+                 f"{len(snaps_by_ticker)} | scores: {len(scores)} "
+                 f"| eligibles: {rep_rank['eligible']}")
         if rep_rank["eligible"] > 0 and not snaps_by_ticker:
-            log.error("[PIPELINE] DESYNCHRONISATION ranker/pipeline: aucun "
-                      "snapshot recu (market_ranker.run_ranking ne renvoie pas "
-                      "'snapshots' -- version de fichier probablement ancienne). "
-                      "TOUS les eligibles seront comptes snapshot_missing.")
+            log.error("[PIPELINE] INCOHERENCE INTERNE: scores eligibles sans "
+                      "snapshots issus du scan du pipeline -- a signaler.")
 
         rejections = {}
         accepted = []
