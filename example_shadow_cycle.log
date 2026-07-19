@@ -1,0 +1,11 @@
+2026-07-19 19:10:02,162 INFO [PIPELINE] [CLASSIFY] KXBTC15M-26JUL191500-00 category=Crypto market_type=btc_above_strike_15m
+2026-07-19 19:10:02,162 INFO [PIPELINE] [PIPELINE] snapshots (scan pipeline): 1 | scores: 1 | eligibles: 1
+2026-07-19 19:10:02,162 INFO [PIPELINE] [RANK] KXBTC15M-26JUL191500-00 | cat=Crypto | score=80.0
+2026-07-19 19:10:02,162 INFO [PIPELINE] [STRATEGY_SELECTED] ticker=KXBTC15M-26JUL191500-00 market_type=btc_above_strike_15m strategy=btc15m_model_v1
+2026-07-19 19:10:02,162 INFO [PIPELINE] [ROUTER] KXBTC15M-26JUL191500-00 -> strategie=btc15m_model_v1
+2026-07-19 19:10:02,163 INFO [PIPELINE] [MODEL] KXBTC15M-26JUL191500-00 p_modele=0.6500 conf=8
+2026-07-19 19:10:02,163 INFO [PIPELINE] [MODEL_PROBABILITY] ticker=KXBTC15M-26JUL191500-00 probability=0.6500
+2026-07-19 19:10:02,163 INFO [PIPELINE] [EDGE] KXBTC15M-26JUL191500-00 p_marche=0.5100 brut=+0.1400 frais=0.02 slip=0.01 net=+0.1000 ev=+0.1000
+2026-07-19 19:10:02,163 INFO [PIPELINE] [EXECUTION-CANDIDAT] KXBTC15M-26JUL191500-00
+2026-07-19 19:10:02,163 INFO [PIPELINE] [SHADOW_DECISION] {"ticker": "KXBTC15M-26JUL191500-00", "market_type": "btc_above_strike_15m", "strategy": "btc15m_model_v1", "side": "yes", "model_probability": 0.65, "market_price": 0.51, "gross_edge": 0.14, "estimated_fees": 0.02, "estimated_slippage": 0.01, "net_ev": 0.10000000000000002, "risk_passed": null, "would_submit": true, "actual_submission": false}
+2026-07-19 19:10:02,163 INFO [PIPELINE] [PIPELINE] CANDIDAT VALIDE KXBTC15M-26JUL191500-00 YES @ 51c | edge_net=+0.100 ev_net=+0.100 strat=btc15m_model_v1

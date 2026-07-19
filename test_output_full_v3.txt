@@ -1,0 +1,81 @@
+test_active_strategy_registered_and_boot_logged (test_registry_v3.TestRegistry8A.test_active_strategy_registered_and_boot_logged) ... ok
+test_compatible_type_and_series (test_registry_v3.TestRegistry8A.test_compatible_type_and_series) ... ok
+test_deterministic_selection_by_priority (test_registry_v3.TestRegistry8A.test_deterministic_selection_by_priority) ... ok
+test_disabled_strategy_not_routed_but_traced (test_registry_v3.TestRegistry8A.test_disabled_strategy_not_routed_but_traced) ... [STRATEGY_DISABLED] off desactivee par configuration -- non enregistree.
+ok
+test_duplicate_registration_refused (test_registry_v3.TestRegistry8A.test_duplicate_registration_refused) ... Strategie btc15m_model_v1 deja enregistree (meme objet) -- doublon ignore.
+Strategie nommee 'btc15m_model_v1' deja presente -- second enregistrement du meme nom REFUSE.
+ok
+test_empty_registry_raises_explicitly (test_registry_v3.TestRegistry8A.test_empty_registry_raises_explicitly) ... ok
+test_enum_vs_string_equality (test_registry_v3.TestRegistry8A.test_enum_vs_string_equality) ... ok
+test_env_flag_disables_btc_strategy (test_registry_v3.TestRegistry8A.test_env_flag_disables_btc_strategy) ... [STRATEGY_DISABLED] btc15m_model_v1 desactivee par configuration -- non enregistree.
+ok
+test_incompatible_series_detailed_reason (test_registry_v3.TestRegistry8A.test_incompatible_series_detailed_reason) ... ok
+test_incompatible_type (test_registry_v3.TestRegistry8A.test_incompatible_type) ... ok
+test_missing_data_snapshot_without_attrs (test_registry_v3.TestRegistry8A.test_missing_data_snapshot_without_attrs) ... ok
+test_multiple_compatible_equal_priority_is_ambiguous (test_registry_v3.TestRegistry8A.test_multiple_compatible_equal_priority_is_ambiguous) ... X-1: correspondance AMBIGUE (['a', 'b'], priorites egales) -- rejet.
+X-1: correspondance AMBIGUE (['a', 'b'], priorites egales) -- rejet.
+ok
+test_resolve_detailed_agrees_with_resolve (test_registry_v3.TestRegistry8A.test_resolve_detailed_agrees_with_resolve) ... ok
+test_classification_and_resolution_verdicts (test_real_tickers_from_logs.TestRealTickersFromRailwayLogs.test_classification_and_resolution_verdicts) ... ok
+test_unsupported_series_are_not_in_targeted_universe (test_real_tickers_from_logs.TestRealTickersFromRailwayLogs.test_unsupported_series_are_not_in_targeted_universe)
+La consequence correcte de la table de support : ces series ne ... ok
+test_truncated_crawl_misses_btc15m (test_scanner_v2.Test1_BugReproduced_GeneralCrawlTruncated.test_truncated_crawl_misses_btc15m) ... Garde-fou MAX_PAGES=3 atteint -- pagination interrompue (univers peut-etre incomplet).
+ok
+test_empty_priority_and_no_crawl_yields_empty_universe (test_scanner_v2.Test2_TargetedUniverseIsDefault.test_empty_priority_and_no_crawl_yields_empty_universe) ... Scanner: PRIORITY_SERIES vide ET crawl general desactive -- univers vide. Fournir les series des strategies actives (router.supported_series()) ou activer SCANNER_GENERAL_CRAWL_ENABLED=1 pour un diagnostic.
+ok
+test_general_crawl_opt_in_with_dedup (test_scanner_v2.Test2_TargetedUniverseIsDefault.test_general_crawl_opt_in_with_dedup) ... Garde-fou MAX_PAGES=3 atteint -- pagination interrompue (univers peut-etre incomplet).
+ok
+test_missing_priority_series_is_flagged (test_scanner_v2.Test2_TargetedUniverseIsDefault.test_missing_priority_series_is_flagged) ... Serie prioritaire 'KXNOPE': 0 marche renvoye par cet environnement -- la strategie associee ne recevra aucun candidat ce cycle.
+ok
+test_no_general_crawl_by_default (test_scanner_v2.Test2_TargetedUniverseIsDefault.test_no_general_crawl_by_default) ... ok
+test_lookahead_excludes_far_markets (test_scanner_v2.Test3_CapsAndLookahead.test_lookahead_excludes_far_markets) ... ok
+test_max_markets_per_cycle_keeps_best_liquidity (test_scanner_v2.Test3_CapsAndLookahead.test_max_markets_per_cycle_keeps_best_liquidity) ... ok
+test_at_least_90pct_reduction (test_scanner_v2.Test4_Benchmark_Before_After.test_at_least_90pct_reduction) ... Garde-fou MAX_PAGES=200 atteint -- pagination interrompue (univers peut-etre incomplet).
+
+[BENCHMARK synthetique] marches recus: 40000 -> 2 (-100.00%) | appels API: 200 -> 1 (-99.50%)
+ok
+test_btc_strategy_declares_series_types_features (test_router_declarations.TestDeclarations.test_btc_strategy_declares_series_types_features) ... ok
+test_declaration_never_widens_supports (test_router_declarations.TestDeclarations.test_declaration_never_widens_supports)
+Les declarations servent au scanner ; supports() reste le verrou: ... ok
+test_empty_router_declares_nothing (test_router_declarations.TestDeclarations.test_empty_router_declares_nothing) ... ok
+test_router_aggregates_series_from_active_strategies (test_router_declarations.TestDeclarations.test_router_aggregates_series_from_active_strategies) ... ok
+test_detailed_agrees_with_resolve (test_router_declarations.TestResolveDetailed.test_detailed_agrees_with_resolve) ... ok
+test_no_match_diagnostic (test_router_declarations.TestResolveDetailed.test_no_match_diagnostic) ... ok
+test_single_match_diagnostic (test_router_declarations.TestResolveDetailed.test_single_match_diagnostic) ... ok
+test_end_to_end_no_order (test_integration_btc15m_path.TestFullBtc15mPath.test_end_to_end_no_order) ... ok
+test_example_reports_written (test_integration_btc15m_path.TestFullBtc15mPath.test_example_reports_written)
+Genere les artefacts d'exemple exiges dans les livrables. ... ok
+test_reject_cache_and_deep_cap_metrics_present (test_integration_btc15m_path.TestFullBtc15mPath.test_reject_cache_and_deep_cap_metrics_present) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 0.924s
+
+OK
+test_all_outputs_are_known_types (test_market_taxonomy.TestClassification.test_all_outputs_are_known_types) ... ok
+test_btc15m (test_market_taxonomy.TestClassification.test_btc15m) ... ok
+test_btc_hourly_is_not_15m (test_market_taxonomy.TestClassification.test_btc_hourly_is_not_15m) ... ok
+test_deterministic_same_input_same_output (test_market_taxonomy.TestClassification.test_deterministic_same_input_same_output) ... ok
+test_economics_weather_elections (test_market_taxonomy.TestClassification.test_economics_weather_elections) ... ok
+test_eth_15m (test_market_taxonomy.TestClassification.test_eth_15m) ... ok
+test_priority_series_over_title (test_market_taxonomy.TestClassification.test_priority_series_over_title) ... ok
+test_sports_moneyline (test_market_taxonomy.TestClassification.test_sports_moneyline) ... ok
+test_sports_player_prop (test_market_taxonomy.TestClassification.test_sports_player_prop) ... ok
+test_sports_spread (test_market_taxonomy.TestClassification.test_sports_spread) ... ok
+test_sports_total_over_under (test_market_taxonomy.TestClassification.test_sports_total_over_under) ... ok
+test_unknown (test_market_taxonomy.TestClassification.test_unknown) ... ok
+test_accepts_only_btc15m (test_market_taxonomy.TestBtc15mSupports.test_accepts_only_btc15m) ... ok
+test_rejects_btc_hourly (test_market_taxonomy.TestBtc15mSupports.test_rejects_btc_hourly) ... ok
+test_rejects_eth (test_market_taxonomy.TestBtc15mSupports.test_rejects_eth) ... ok
+test_rejects_sports (test_market_taxonomy.TestBtc15mSupports.test_rejects_sports) ... ok
+test_ambiguous_when_two_match (test_market_taxonomy.TestStrictRouter.test_ambiguous_when_two_match) ... KXBTC15M-X: correspondance AMBIGUE (['a', 'b'], priorites egales) -- rejet.
+ok
+test_single_match_resolves (test_market_taxonomy.TestStrictRouter.test_single_match_resolves) ... ok
+test_strategy_without_supports_is_refused (test_market_taxonomy.TestStrictRouter.test_strategy_without_supports_is_refused) ... Strategie bad sans supports(): REFUSEE par le routeur strict.
+ok
+test_registry_contains_only_real_strategies (test_market_taxonomy.TestStrictRouter.test_registry_contains_only_real_strategies) ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 0.001s
+
+OK

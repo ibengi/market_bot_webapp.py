@@ -1,0 +1,3 @@
+2026-07-19 19:09:27,079 INFO [BOT] [BUILD_INFO] git_commit=<non defini: a fournir par Railway> build_timestamp=<injecte au build> entrypoint=kalshi_alpha_bot.py python_version=3.12.3 config_environment=demo strategy_registry_count=1
+2026-07-19 19:09:27,079 INFO [ROUTER] [STRATEGY_REGISTRY_BOOT] {"count": 1, "disabled": [], "strategies": [{"name": "btc15m_model_v1", "enabled": true, "priority": 100, "supported_market_types": ["btc_above_strike_15m"], "supported_series": ["KXBTC15M"]}]}
+2026-07-19 19:09:27,079 INFO [BOT] registre valide -- demarrage autorise
