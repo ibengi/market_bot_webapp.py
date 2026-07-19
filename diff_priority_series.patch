@@ -1,0 +1,111 @@
+--- /mnt/user-data/uploads/market_scanner.py	2026-07-19 14:04:39.060666000 +0000
++++ market_scanner.py	2026-07-19 14:12:03.027350747 +0000
+@@ -56,6 +56,17 @@
+     EXCLUDED_CATEGORIES= _env_list("SCANNER_EXCLUDED_CATEGORIES")
+     PAGE_LIMIT         = _env_i("SCANNER_PAGE_LIMIT", 200)
+     MAX_PAGES          = _env_i("SCANNER_MAX_PAGES", 200)  # garde-fou anti-boucle
++    # ── CORRECTION 2026-07-19 : series prioritaires (filtrage API niveau 1) ──
++    # Le crawl general /markets est TRONQUE a MAX_PAGES (observe en prod :
++    # 40 000 marches, warning "univers peut-etre incomplet" a chaque cycle).
++    # Consequence mesuree : AUCUN marche KXBTC15M — la seule serie servie par
++    # une strategie reelle — n'atteignait jamais le pipeline. Chaque serie
++    # listee ici est recuperee DIRECTEMENT via le parametre serveur
++    # `series_ticker` (deja utilise par KalshiClient.get_markets), puis
++    # fusionnee dans l'univers avec deduplication par ticker. L'inclusion des
++    # series supportees ne depend donc plus de l'ordre de pagination.
++    PRIORITY_SERIES    = _env_list("SCANNER_PRIORITY_SERIES") or ["KXBTC15M"]
++    PRIORITY_MAX_PAGES = _env_i("SCANNER_PRIORITY_MAX_PAGES", 5)
+     UNIVERSE_FILE      = os.getenv("SCANNER_UNIVERSE_FILE", "market_universe.json")
+     REPORT_FILE        = os.getenv("SCANNER_REPORT_FILE", "market_scanner_report.json")
+ 
+@@ -325,6 +336,69 @@
+                     f"pagination interrompue (univers peut-etre incomplet).")
+     return markets, pages, errors
+ 
++
++def fetch_series_markets(client, series: str, status: str = "open",
++                         cfg: ScanConfig = SCFG) -> (list, int, int):
++    """Recupere UNE serie via le filtre serveur `series_ticker` (pagination
++    bornee). Meme contrat de retour que fetch_all_markets."""
++    markets, cursor, pages, errors = [], None, 0, 0
++    while pages < cfg.PRIORITY_MAX_PAGES:
++        params = {"status": status, "limit": cfg.PAGE_LIMIT,
++                  "series_ticker": series}
++        if cursor:
++            params["cursor"] = cursor
++        try:
++            r = client._req("GET", "/markets", params=params)
++        except Exception as e:
++            errors += 1
++            log.error(f"Serie prioritaire {series} page {pages + 1}: {e}")
++            break
++        pages += 1
++        batch = r.get("markets", []) or []
++        markets.extend(batch)
++        cursor = r.get("cursor")
++        if not cursor or not batch:
++            break
++    return markets, pages, errors
++
++
++def fetch_universe(client, status: str = "open",
++                   cfg: ScanConfig = SCFG) -> dict:
++    """Series prioritaires (filtre serveur) PUIS crawl general, avec
++    deduplication par ticker. Garantit que les series servies par une
++    strategie reelle figurent dans l'univers meme si le crawl general est
++    tronque par MAX_PAGES."""
++    prio_markets, prio_pages, prio_errors = [], 0, 0
++    prio_counts, prio_empty = {}, []
++    for serie in (cfg.PRIORITY_SERIES or []):
++        mk, pg, er = fetch_series_markets(client, serie, status=status, cfg=cfg)
++        prio_markets.extend(mk)
++        prio_pages += pg
++        prio_errors += er
++        prio_counts[serie] = len(mk)
++        if not mk:
++            prio_empty.append(serie)
++            log.warning(f"Serie prioritaire '{serie}': 0 marche renvoye par "
++                        f"cet environnement -- la strategie associee ne "
++                        f"recevra aucun candidat ce cycle.")
++    gen_markets, gen_pages, gen_errors = fetch_all_markets(
++        client, status=status, cfg=cfg)
++    seen, merged, dups = set(), [], 0
++    for m in prio_markets + gen_markets:      # priorite d'abord => conservee
++        tk = m.get("ticker")
++        if tk in seen:
++            dups += 1
++            continue
++        seen.add(tk)
++        merged.append(m)
++    return {"markets": merged,
++            "pages": prio_pages + gen_pages,
++            "errors": prio_errors + gen_errors,
++            "priority_series": list(cfg.PRIORITY_SERIES or []),
++            "priority_markets_received": prio_counts,
++            "priority_series_empty": prio_empty,
++            "deduplicated": dups}
++
+ # ── Scan complet + rapports ──────────────────────────────────────────────────
+ 
+ def _top(snaps: list, key: str, n: int = 20) -> list:
+@@ -337,7 +411,8 @@
+              now: Optional[datetime] = None) -> dict:
+     """Scan complet. AUCUN ordre : ce module n'expose ni n'appelle aucune
+     fonction d'envoi d'ordre (garanti par test statique)."""
+-    raw_markets, pages, errors = fetch_all_markets(client, cfg=cfg)
++    uni = fetch_universe(client, cfg=cfg)
++    raw_markets, pages, errors = uni["markets"], uni["pages"], uni["errors"]
+     snaps = [build_snapshot(m, now=now, cfg=cfg) for m in raw_markets]
+     valid = [s for s in snaps if s.included]
+     excl_by_reason = {}
+@@ -355,6 +430,10 @@
+         "total_markets_received": len(raw_markets),
+         "api_pages": pages,
+         "api_error_pages": errors,
++        "priority_series": uni["priority_series"],
++        "priority_markets_received": uni["priority_markets_received"],
++        "priority_series_empty": uni["priority_series_empty"],
++        "deduplicated": uni["deduplicated"],
+         "valid_markets": len(valid),
+         "excluded_by_reason": excl_by_reason,
+         "by_category": by_cat,
