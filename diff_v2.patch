@@ -1,0 +1,370 @@
+--- /mnt/user-data/uploads/market_scanner.py	2026-07-19 14:04:39.060666000 +0000
++++ market_scanner.py	2026-07-19 14:21:49.500317462 +0000
+@@ -56,6 +56,22 @@
+     EXCLUDED_CATEGORIES= _env_list("SCANNER_EXCLUDED_CATEGORIES")
+     PAGE_LIMIT         = _env_i("SCANNER_PAGE_LIMIT", 200)
+     MAX_PAGES          = _env_i("SCANNER_MAX_PAGES", 200)  # garde-fou anti-boucle
++    # ── v2 (2026-07-19) : univers CIBLE par defaut ───────────────────────────
++    # Cause racine observee en prod : crawl general /markets tronque a
++    # MAX_PAGES (40 000 marches, warning a chaque cycle) => la seule serie
++    # servie par une strategie reelle (KXBTC15M) n'entrait jamais dans
++    # l'univers. Le mode par defaut est desormais : fetch serveur des SEULES
++    # series supportees par les strategies actives (parametre API
++    # `series_ticker`, deja utilise par KalshiClient.get_markets). Le crawl
++    # general n'est active QUE pour la decouverte/diagnostic.
++    # PRIORITY_SERIES n'est PAS code en dur : vide par defaut, rempli par
++    # l'appelant depuis router.supported_series() (voir opportunity_pipeline)
++    # ou surcharge par SCANNER_PRIORITY_SERIES.
++    PRIORITY_SERIES        = _env_list("SCANNER_PRIORITY_SERIES")
++    PRIORITY_MAX_PAGES     = _env_i("SCANNER_PRIORITY_MAX_PAGES", 5)
++    GENERAL_CRAWL_ENABLED  = _env_b("SCANNER_GENERAL_CRAWL_ENABLED", False)
++    MAX_MARKETS_PER_CYCLE  = _env_i("SCANNER_MAX_MARKETS_PER_CYCLE", 300)
++    LOOKAHEAD_HOURS        = _env_f("SCANNER_LOOKAHEAD_HOURS", 24.0)
+     UNIVERSE_FILE      = os.getenv("SCANNER_UNIVERSE_FILE", "market_universe.json")
+     REPORT_FILE        = os.getenv("SCANNER_REPORT_FILE", "market_scanner_report.json")
+ 
+@@ -275,6 +291,9 @@
+         return "closes_too_soon"
+     if s.minutes_remaining is not None and s.minutes_remaining > cfg.MAX_MINUTES:
+         return "unsupported"
++    if s.minutes_remaining is not None and cfg.LOOKAHEAD_HOURS \
++            and s.minutes_remaining > cfg.LOOKAHEAD_HOURS * 60.0:
++        return "beyond_lookahead"
+     if book["reason"] == "invalid_book":
+         return "invalid_book"
+     if book["reason"] == "no_liquidity":
+@@ -325,6 +344,80 @@
+                     f"pagination interrompue (univers peut-etre incomplet).")
+     return markets, pages, errors
+ 
++
++def fetch_series_markets(client, series: str, status: str = "open",
++                         cfg: ScanConfig = SCFG) -> (list, int, int):
++    """Recupere UNE serie via le filtre serveur `series_ticker` (pagination
++    bornee). Meme contrat de retour que fetch_all_markets."""
++    markets, cursor, pages, errors = [], None, 0, 0
++    while pages < cfg.PRIORITY_MAX_PAGES:
++        params = {"status": status, "limit": cfg.PAGE_LIMIT,
++                  "series_ticker": series}
++        if cursor:
++            params["cursor"] = cursor
++        try:
++            r = client._req("GET", "/markets", params=params)
++        except Exception as e:
++            errors += 1
++            log.error(f"Serie prioritaire {series} page {pages + 1}: {e}")
++            break
++        pages += 1
++        batch = r.get("markets", []) or []
++        markets.extend(batch)
++        cursor = r.get("cursor")
++        if not cursor or not batch:
++            break
++    return markets, pages, errors
++
++
++def fetch_universe(client, status: str = "open",
++                   cfg: ScanConfig = SCFG) -> dict:
++    """Construit l'univers de scan.
++    MODE PAR DEFAUT (cible) : uniquement les series de PRIORITY_SERIES via le
++    filtre serveur `series_ticker`. Le crawl general /markets n'est execute
++    que si GENERAL_CRAWL_ENABLED (decouverte/diagnostic).
++    Deduplication par ticker ; metriques d'appels API."""
++    prio_markets, prio_pages, prio_errors = [], 0, 0
++    prio_counts, prio_empty = {}, []
++    for serie in (cfg.PRIORITY_SERIES or []):
++        mk, pg, er = fetch_series_markets(client, serie, status=status, cfg=cfg)
++        prio_markets.extend(mk)
++        prio_pages += pg
++        prio_errors += er
++        prio_counts[serie] = len(mk)
++        if not mk:
++            prio_empty.append(serie)
++            log.warning(f"Serie prioritaire '{serie}': 0 marche renvoye par "
++                        f"cet environnement -- la strategie associee ne "
++                        f"recevra aucun candidat ce cycle.")
++    gen_markets, gen_pages, gen_errors = [], 0, 0
++    if cfg.GENERAL_CRAWL_ENABLED:
++        gen_markets, gen_pages, gen_errors = fetch_all_markets(
++            client, status=status, cfg=cfg)
++    elif not cfg.PRIORITY_SERIES:
++        log.warning("Scanner: PRIORITY_SERIES vide ET crawl general "
++                    "desactive -- univers vide. Fournir les series des "
++                    "strategies actives (router.supported_series()) ou "
++                    "activer SCANNER_GENERAL_CRAWL_ENABLED=1 pour un "
++                    "diagnostic.")
++    seen, merged, dups = set(), [], 0
++    for m in prio_markets + gen_markets:      # priorite d'abord => conservee
++        tk = m.get("ticker")
++        if tk in seen:
++            dups += 1
++            continue
++        seen.add(tk)
++        merged.append(m)
++    return {"markets": merged,
++            "pages": prio_pages + gen_pages,
++            "errors": prio_errors + gen_errors,
++            "api_calls": prio_pages + gen_pages,
++            "general_crawl_enabled": bool(cfg.GENERAL_CRAWL_ENABLED),
++            "priority_series": list(cfg.PRIORITY_SERIES or []),
++            "priority_markets_received": prio_counts,
++            "priority_series_empty": prio_empty,
++            "deduplicated": dups}
++
+ # ── Scan complet + rapports ──────────────────────────────────────────────────
+ 
+ def _top(snaps: list, key: str, n: int = 20) -> list:
+@@ -337,8 +430,24 @@
+              now: Optional[datetime] = None) -> dict:
+     """Scan complet. AUCUN ordre : ce module n'expose ni n'appelle aucune
+     fonction d'envoi d'ordre (garanti par test statique)."""
+-    raw_markets, pages, errors = fetch_all_markets(client, cfg=cfg)
++    uni = fetch_universe(client, cfg=cfg)
++    raw_markets, pages, errors = uni["markets"], uni["pages"], uni["errors"]
+     snaps = [build_snapshot(m, now=now, cfg=cfg) for m in raw_markets]
++    # ── Plafond par cycle : tri qualite (liquidite desc, spread asc, temps
++    # restant asc, volume desc) puis coupe a MAX_MARKETS_PER_CYCLE. Les
++    # valides passent avant les exclus ; les coupes sont comptees.
++    capped = 0
++    if cfg.MAX_MARKETS_PER_CYCLE and len(snaps) > cfg.MAX_MARKETS_PER_CYCLE:
++        def _key(s):
++            return (0 if s.included else 1,
++                    -(s.liquidity or 0),
++                    s.spread_yes if s.spread_yes is not None else 999,
++                    s.minutes_remaining if s.minutes_remaining is not None
++                    else 1e9,
++                    -(s.volume or 0))
++        snaps.sort(key=_key)
++        capped = len(snaps) - cfg.MAX_MARKETS_PER_CYCLE
++        snaps = snaps[:cfg.MAX_MARKETS_PER_CYCLE]
+     valid = [s for s in snaps if s.included]
+     excl_by_reason = {}
+     for s in snaps:
+@@ -353,8 +462,16 @@
+     report = {
+         "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+         "total_markets_received": len(raw_markets),
++        "markets_kept": len(snaps),
++        "capped_by_max_markets": capped,
+         "api_pages": pages,
++        "api_calls": uni["api_calls"],
+         "api_error_pages": errors,
++        "general_crawl_enabled": uni["general_crawl_enabled"],
++        "priority_series": uni["priority_series"],
++        "priority_markets_received": uni["priority_markets_received"],
++        "priority_series_empty": uni["priority_series_empty"],
++        "deduplicated": uni["deduplicated"],
+         "valid_markets": len(valid),
+         "excluded_by_reason": excl_by_reason,
+         "by_category": by_cat,
+@@ -367,7 +484,9 @@
+                     ("MIN_MINUTES", "MAX_MINUTES", "MIN_VOLUME",
+                      "MIN_OPEN_INTEREST", "MAX_SPREAD_CENTS",
+                      "REQUIRE_LIQUIDITY", "ALLOWED_CATEGORIES",
+-                     "EXCLUDED_CATEGORIES")},
++                     "EXCLUDED_CATEGORIES", "GENERAL_CRAWL_ENABLED",
++                     "MAX_MARKETS_PER_CYCLE", "LOOKAHEAD_HOURS",
++                     "PRIORITY_SERIES")},
+     }
+     if save:
+         _save_json(cfg.UNIVERSE_FILE,
+--- /mnt/user-data/uploads/strategy_router.py	2026-07-19 14:04:38.754108000 +0000
++++ strategy_router.py	2026-07-19 14:22:12.670719634 +0000
+@@ -117,6 +117,47 @@
+             cats.update(getattr(s, "categories", []))
+         return sorted(cats)
+ 
++    # ── v2 (2026-07-19) : le scanner derive son univers des strategies ──────
++    def supported_series(self) -> list:
++        """Series Kalshi declarees par les strategies ACTIVES enregistrees.
++        Source unique pour ScanConfig.PRIORITY_SERIES : le scanner ne
++        maintient AUCUNE liste independante susceptible de diverger."""
++        out = set()
++        for s in self._strategies:
++            out.update(getattr(s, "supported_series", ()) or ())
++        return sorted(out)
++
++    def supported_market_types(self) -> list:
++        out = set()
++        for s in self._strategies:
++            out.update(getattr(s, "supported_market_types", ()) or ())
++        return sorted(out)
++
++    def resolve_detailed(self, snapshot) -> dict:
++        """Diagnostic structure de la resolution (ne remplace pas resolve():
++        meme logique, sortie enrichie pour les logs et les traces)."""
++        matches = [s for s in self._strategies if s.supports(snapshot)]
++        names = [getattr(s, "name", s.__class__.__name__)
++                 for s in self._strategies]
++        mnames = [getattr(s, "name", s.__class__.__name__) for s in matches]
++        code = None
++        if not matches:
++            code = "no_compatible_strategy"
++        elif len(matches) > 1:
++            code = "ambiguous_strategy_match"
++        return {
++            "market_ticker": getattr(snapshot, "ticker", None),
++            "market_type": getattr(snapshot, "market_type", None),
++            "category": getattr(snapshot, "category", None),
++            "series_ticker": getattr(snapshot, "series_ticker", None),
++            "registered_strategies": names,
++            "registered_series": self.supported_series(),
++            "registered_market_types": self.supported_market_types(),
++            "compatible_strategies": mnames,
++            "selected_strategy": mnames[0] if len(matches) == 1 else None,
++            "rejection_code": code,
++        }
++
+ def evaluate_candidate(snapshot, fresh_market: dict, book: dict,
+                        router: StrategyRouter,
+                        gates: GateConfig) -> SignalDecision:
+@@ -255,6 +296,12 @@
+     name = "btc15m_model_v1"
+     categories = ["Crypto"]
+     SERIES_PREFIX = "KXBTC15M"
++    # Declarations consommees par le routeur puis le scanner (univers cible).
++    # supports() reste le verrou final ; ces champs n'elargissent rien.
++    supported_series = ("KXBTC15M",)
++    supported_market_types = ("btc_above_strike_15m",)
++    required_features = ("floor_strike|cap_strike|strike_price",
++                         "minutes_remaining")
+ 
+     def __init__(self, context_provider=None, model_predict=None):
+         # injectables pour tests hors-ligne ; par defaut, les vrais modules
+--- /mnt/user-data/uploads/opportunity_pipeline.py	2026-07-19 14:04:38.728912000 +0000
++++ opportunity_pipeline.py	2026-07-19 14:23:09.137515692 +0000
+@@ -46,6 +46,40 @@
+         self.fresh_book_fn = fresh_book_fn
+         self.save_artifacts = save_artifacts
+         self.observer = observer
++        # ── v2 (2026-07-19) ──────────────────────────────────────────────────
++        # Plafond d'analyses profondes par cycle (niveau 3) et cache TTL des
++        # rejets : un marche rejete pour une raison PERMANENTE (aucune
++        # strategie ne le supportera jamais pendant sa vie) n'est pas
++        # re-analyse a chaque cycle ; une raison temporaire est reevaluee
++        # apres TTL.
++        import os as _os
++        self.max_deep_analyses = int(_os.getenv(
++            "SCAN_MAX_DEEP_ANALYSES_PER_CYCLE", "50"))
++        self.reject_ttl_permanent = float(_os.getenv(
++            "PIPELINE_REJECT_TTL_PERMANENT_S", "3600"))
++        self.reject_ttl_temporary = float(_os.getenv(
++            "PIPELINE_REJECT_TTL_TEMPORARY_S", "120"))
++        self._reject_cache = {}          # ticker -> (reason, expires_epoch)
++    _PERMANENT_REJECTS = ("no_compatible_strategy", "ambiguous_strategy_match")
++
++    def _reject_cached(self, ticker, now_epoch):
++        ent = self._reject_cache.get(ticker)
++        if not ent:
++            return None
++        reason, exp = ent
++        if now_epoch >= exp:
++            del self._reject_cache[ticker]
++            return None
++        return reason
++
++    def _cache_reject(self, snap, reason, now_epoch):
++        if reason in self._PERMANENT_REJECTS:
++            mins = getattr(snap, "minutes_remaining", None)
++            ttl = min(self.reject_ttl_permanent,
++                      mins * 60.0) if mins else self.reject_ttl_permanent
++        else:
++            ttl = self.reject_ttl_temporary
++        self._reject_cache[snap.ticker] = (reason, now_epoch + max(ttl, 1.0))
+ 
+     # ── un cycle complet ─────────────────────────────────────────────────
+     def run_cycle(self, max_accepted: int = 1,
+@@ -62,6 +96,15 @@
+         # (parametre `snapshots` present dans toutes les versions du ranker).
+         # Le couplage par valeur de retour est supprime ; un melange de
+         # versions de fichiers ne peut plus provoquer cette panne.
++        # ── v2 : l'univers du scanner derive des strategies ACTIVES ──────────
++        # (source unique : router.supported_series() ; surchargable par env
++        # SCANNER_PRIORITY_SERIES deja lue dans ScanConfig). Aucune liste de
++        # series codee en dur cote scanner.
++        if not getattr(self.scan_cfg, "PRIORITY_SERIES", None):
++            try:
++                self.scan_cfg.PRIORITY_SERIES = self.router.supported_series()
++            except Exception:
++                pass
+         scan = run_scan(self.client, cfg=self.scan_cfg,
+                         save=self.save_artifacts)
+         own_snapshots = scan["snapshots"]
+@@ -106,9 +149,21 @@
+         self.last_traces = []
+ 
+         eligible = [q for q in scores if q.eligible]
++        import time as _time
++        now_epoch = _time.time()
++        cache_hits = 0
++        deep_capped = 0
+         for q in eligible:
+             if len(accepted) >= max_accepted:
+                 break
++            if examined >= self.max_deep_analyses:
++                deep_capped += 1
++                continue
++            cached = self._reject_cached(q.ticker, now_epoch)
++            if cached is not None:
++                cache_hits += 1
++                rejections[cached] = rejections.get(cached, 0) + 1
++                continue
+             snap = snaps_by_ticker.get(q.ticker)
+             if snap is None:
+                 rejections["snapshot_missing"] = \
+@@ -142,6 +197,18 @@
+                 if pre_why == "ambiguous_strategy_match":
+                     n_ambiguous += 1
+                 rejections[pre_why] = rejections.get(pre_why, 0) + 1
++                self._cache_reject(snap, pre_why, now_epoch)
++                diag = None
++                if hasattr(self.router, "resolve_detailed"):
++                    try:
++                        diag = self.router.resolve_detailed(snap)
++                        log.info(f"[ROUTER-DIAG] {q.ticker} "
++                                 f"type={diag['market_type']} "
++                                 f"code={diag['rejection_code']} "
++                                 f"series_supportees="
++                                 f"{diag['registered_series']}")
++                    except Exception:
++                        diag = None
+                 log.info(f"[REJECT] {q.ticker} {pre_why}")
+                 self.last_traces.append({
+                     "ticker": q.ticker, "ranker_score": q.total_score,
+@@ -150,7 +217,8 @@
+                     "confidence": None, "market_probability": None,
+                     "gross_edge": None, "estimated_fees": None,
+                     "slippage": None, "net_edge": None, "net_ev": None,
+-                    "decision": "REJECT", "reject_reason": pre_why})
++                    "decision": "REJECT", "reject_reason": pre_why,
++                    "router_diagnostic": diag})
+                 continue
+ 
+             # carnet FRAIS si le moteur fournit la fonction, sinon snapshot
+@@ -213,6 +281,7 @@
+             else:
+                 rejections[dec.rejection_reason] = \
+                     rejections.get(dec.rejection_reason, 0) + 1
++                self._cache_reject(snap, dec.rejection_reason, now_epoch)
+ 
+         # les non-eligibles du ranker comptent aussi dans les rejets
+         for q in scores:
+@@ -228,11 +297,17 @@
+                                       if k in ("no_liquidity", "expired",
+                                                "closes_too_soon", "invalid_book",
+                                                "spread_too_wide", "low_volume",
+-                                               "unsupported")),
++                                               "unsupported",
++                                               "beyond_lookahead")),
+             "valid": None,   # renseigne ci-dessous (= inclus par le scanner)
+             "ranker_eligible": rep_rank["eligible"],
+             "eligible": rep_rank["eligible"],
+             "candidates_examined": examined,
++            "deep_analysis_count": examined,
++            "deep_analysis_capped": deep_capped,
++            "max_deep_analyses_per_cycle": self.max_deep_analyses,
++            "reject_cache_hits": cache_hits,
++            "reject_cache_size": len(self._reject_cache),
+             "classified": n_classified,
+             "unknown_market_type": n_unknown_type,
+             "prefiltered_no_strategy": n_prefiltered,
