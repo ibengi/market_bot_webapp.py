@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.env
+env
+venv/
+.venv/
+data/
+*.jsonl
+kalshi_*.json
+cycle_report.json
+orders_state.json
+universe_cache.json
+test_report.json
+raw_samples/
+backups/
+*.log
+.DS_Store
