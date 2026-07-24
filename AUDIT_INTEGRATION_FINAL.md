@@ -1,4 +1,4 @@
-# AUDIT_INTEGRATION_FINAL — Pipeline intégré Kalshi Alpha Engine
+# docs/audit-integration-final.md
 *2026-07-11. Périmètre : intégration scanner→ranker→routeur→edge/EV→risque→exécution.*
 
 ## 1. Architecture avant / après
@@ -164,3 +164,4 @@ partir des résultats réels. Sorties brutes complètes : REPRODUCIBILITY.md.
 La stratégie crypto est explicitement désactivée sans btc_context (option 3
 + injection de fournisseur possible via StrategyRouter) : démarrage shadow
 sans crash et zéro create_order sans modèle, vérifiés par test_repo_integrity.
+Move audit document to docs folder
